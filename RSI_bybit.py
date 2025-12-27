@@ -95,6 +95,39 @@ RATE_LIMIT_QUEUE_TIMEOUT = 300  # Maximum time to wait in queue (5 minutes)
 MONITOR_TIMEOUT = 900  # 15 minutes (increased from 10)
 
 # =========================
+# CONFIG VALIDATION
+# =========================
+def validate_config() -> None:
+    errors = []
+
+    if not TELEGRAM_BOT_TOKEN:
+        errors.append("TELEGRAM_BOT_TOKEN is required")
+    if not BYBIT_BASE_URL:
+        errors.append("BYBIT_BASE_URL must not be empty")
+    if LEVERAGE <= 0:
+        errors.append("LEVERAGE must be > 0")
+    if ALERT_CHECK_SEC <= 0:
+        errors.append("ALERT_CHECK_SEC must be > 0")
+    if MAX_SYMBOLS <= 0:
+        errors.append("MAX_SYMBOLS must be > 0")
+    if MAX_CONCURRENCY <= 0:
+        errors.append("MAX_CONCURRENCY must be > 0")
+    if KLINE_LIMIT <= 0:
+        errors.append("KLINE_LIMIT must be > 0")
+    if RATE_LIMIT_DELAY <= 0:
+        errors.append("RATE_LIMIT_DELAY must be > 0")
+    if RATE_LIMIT_MAX_DELAY < RATE_LIMIT_DELAY:
+        errors.append("RATE_LIMIT_MAX_DELAY must be >= RATE_LIMIT_DELAY")
+    if RATE_LIMIT_QUEUE_TIMEOUT <= 0:
+        errors.append("RATE_LIMIT_QUEUE_TIMEOUT must be > 0")
+    if MONITOR_TIMEOUT <= 0:
+        errors.append("MONITOR_TIMEOUT must be > 0")
+
+    if errors:
+        msg = "Config validation failed:\n- " + "\n- ".join(errors)
+        raise RuntimeError(msg)
+
+# =========================
 # LOGGING
 # =========================
 logging.basicConfig(
@@ -387,6 +420,8 @@ async def get_kline_rows(
 
 async def get_kline_closes(session: aiohttp.ClientSession, rate_limiter: RateLimiter, symbol: str, interval: str, limit: int) -> List[float]:
     rows = await get_kline_rows(session, rate_limiter, symbol, interval, limit)
+    if not rows:
+        raise BybitAPIError(f"No kline rows for {symbol} interval={interval} limit={limit}")
     closes: List[float] = []
     for c in rows:
         # [startTime, open, high, low, close, volume, turnover]
@@ -402,6 +437,8 @@ async def get_kline_closes(session: aiohttp.ClientSession, rate_limiter: RateLim
 
 
 def rsi_wilder(closes: List[float], period: int) -> Optional[float]:
+    if not closes:
+        return None
     if len(closes) < period + 1:
         return None
 
@@ -456,7 +493,7 @@ async def compute_symbol_rsi_sum(
     try:
         await asyncio.gather(*(one_tf(lbl, iv) for (lbl, iv) in TIMEFRAMES))
     except Exception as e:
-        logging.debug("Failed to compute RSI for %s: %s", symbol, e)
+        logging.warning("Failed to compute RSI for %s: %s", symbol, e)
         return None
 
     s = sum(rsis[lbl] for (lbl, _) in TIMEFRAMES)
@@ -683,13 +720,15 @@ def pairs_keyboard(long_syms: List[str], short_syms: List[str]) -> InlineKeyboar
 # =========================
 # BOT STATE HELPERS
 # =========================
-def get_sub(app: Application, chat_id: int) -> Optional[dict]:
+async def get_sub(app: Application, chat_id: int) -> Optional[dict]:
     """Get subscription for chat_id with thread-safe state access."""
     if not validate_chat_id(chat_id):
         return None
-    state = app.bot_data.get("state") or {"subs": {}, "alerts": {}}
-    subs = state.get("subs", {})
-    return subs.get(str(chat_id))
+    state_lock: asyncio.Lock = app.bot_data["state_lock"]
+    async with state_lock:
+        state = app.bot_data.get("state") or {"subs": {}, "alerts": {}}
+        subs = state.get("subs", {})
+        return subs.get(str(chat_id))
 
 
 async def set_sub(app: Application, chat_id: int, interval_min: int, enabled: bool = True) -> None:
@@ -718,13 +757,15 @@ async def delete_sub(app: Application, chat_id: int) -> None:
         save_state(state)
 
 
-def get_alerts_for_chat(app: Application, chat_id: int) -> Dict[str, dict]:
+async def get_alerts_for_chat(app: Application, chat_id: int) -> Dict[str, dict]:
     """Get alerts for chat_id with thread-safe state access."""
     if not validate_chat_id(chat_id):
         return {}
-    state = app.bot_data.get("state") or {"subs": {}, "alerts": {}}
-    alerts = state.get("alerts", {})
-    return alerts.get(str(chat_id), {})
+    state_lock: asyncio.Lock = app.bot_data["state_lock"]
+    async with state_lock:
+        state = app.bot_data.get("state") or {"subs": {}, "alerts": {}}
+        alerts = state.get("alerts", {})
+        return alerts.get(str(chat_id), {})
 
 
 async def set_alert_state(
@@ -813,11 +854,18 @@ async def get_cached_perp_symbols(app: Application) -> List[str]:
     if cached and (now - cached.ts) <= PERP_SYMBOLS_CACHE_TTL:
         return cached.value  # type: ignore
 
-    session: aiohttp.ClientSession = app.bot_data["http_session"]
-    rate_limiter: RateLimiter = app.bot_data["rate_limiter"]
-    symbols = await get_all_usdt_linear_perp_symbols(session, rate_limiter)
-    app.bot_data["perp_symbols_cache"] = CacheItem(ts=now, value=symbols)
-    return symbols
+    cache_lock: asyncio.Lock = app.bot_data["perp_symbols_lock"]
+    async with cache_lock:
+        now = time.time()
+        cached = app.bot_data.get("perp_symbols_cache")
+        if cached and (now - cached.ts) <= PERP_SYMBOLS_CACHE_TTL:
+            return cached.value  # type: ignore
+
+        session: aiohttp.ClientSession = app.bot_data["http_session"]
+        rate_limiter: RateLimiter = app.bot_data["rate_limiter"]
+        symbols = await get_all_usdt_linear_perp_symbols(session, rate_limiter)
+        app.bot_data["perp_symbols_cache"] = CacheItem(ts=now, value=symbols)
+        return symbols
 
 
 async def get_cached_top_symbols(app: Application) -> List[str]:
@@ -826,12 +874,19 @@ async def get_cached_top_symbols(app: Application) -> List[str]:
     if cached and (now - cached.ts) <= TICKERS_CACHE_TTL:
         return cached.value  # type: ignore
 
-    session: aiohttp.ClientSession = app.bot_data["http_session"]
-    rate_limiter: RateLimiter = app.bot_data["rate_limiter"]
-    perp_symbols = await get_cached_perp_symbols(app)
-    top = await pick_top_symbols_by_turnover(session, rate_limiter, set(perp_symbols), MAX_SYMBOLS)
-    app.bot_data["tickers_cache"] = CacheItem(ts=now, value=top)
-    return top
+    cache_lock: asyncio.Lock = app.bot_data["tickers_lock"]
+    async with cache_lock:
+        now = time.time()
+        cached = app.bot_data.get("tickers_cache")
+        if cached and (now - cached.ts) <= TICKERS_CACHE_TTL:
+            return cached.value  # type: ignore
+
+        session: aiohttp.ClientSession = app.bot_data["http_session"]
+        rate_limiter: RateLimiter = app.bot_data["rate_limiter"]
+        perp_symbols = await get_cached_perp_symbols(app)
+        top = await pick_top_symbols_by_turnover(session, rate_limiter, set(perp_symbols), MAX_SYMBOLS)
+        app.bot_data["tickers_cache"] = CacheItem(ts=now, value=top)
+        return top
 
 
 # =========================
@@ -975,29 +1030,36 @@ async def run_monitor_once_internal(app: Application, chat_id: int):
     sem = asyncio.Semaphore(MAX_CONCURRENCY)
 
     results: List[Tuple[str, float, Dict[str, float]]] = []
-    tasks = [compute_symbol_rsi_sum(session, rate_limiter, sem, s) for s in symbols]
+    tasks = [asyncio.create_task(compute_symbol_rsi_sum(session, rate_limiter, sem, s)) for s in symbols]
 
     # Track task statistics
     total_tasks = len(tasks)
     success_count = 0
     error_count = 0
 
-    for coro in asyncio.as_completed(tasks):
-        try:
-            r = await coro
-            if r is not None:
-                results.append(r)
-                success_count += 1
-            else:
+    try:
+        for task in asyncio.as_completed(tasks):
+            try:
+                r = await task
+                if r is not None:
+                    results.append(r)
+                    success_count += 1
+                else:
+                    error_count += 1
+            except asyncio.CancelledError:
+                logging.warning("Task cancelled during monitor scan")
                 error_count += 1
-        except asyncio.CancelledError:
-            logging.warning("Task cancelled during monitor scan")
-            error_count += 1
-            raise
-        except Exception as e:
-            logging.warning("Failed to compute RSI for a symbol: %s", e)
-            error_count += 1
-            continue
+                raise
+            except Exception as e:
+                logging.warning("Failed to compute RSI for a symbol: %s", e)
+                error_count += 1
+                continue
+    finally:
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
 
     # Calculate error rate
     error_rate = error_count / total_tasks if total_tasks > 0 else 0
@@ -1028,6 +1090,10 @@ async def run_monitor_once_internal(app: Application, chat_id: int):
 
 async def run_monitor_once(app: Application, chat_id: int):
     """Run monitor with timeout protection."""
+    monitor_tasks: Set[asyncio.Task] = app.bot_data.setdefault("monitor_tasks", set())
+    current_task = asyncio.current_task()
+    if current_task:
+        monitor_tasks.add(current_task)
     try:
         await asyncio.wait_for(run_monitor_once_internal(app, chat_id), timeout=MONITOR_TIMEOUT)
     except asyncio.TimeoutError:
@@ -1036,6 +1102,9 @@ async def run_monitor_once(app: Application, chat_id: int):
             chat_id=chat_id,
             text=f"⚠️ Превышено время ожидания ({MONITOR_TIMEOUT}с). Попробуйте позже."
         )
+    finally:
+        if current_task:
+            monitor_tasks.discard(current_task)
 
 
 # =========================
@@ -1090,7 +1159,7 @@ async def alert_job_callback(context: ContextTypes.DEFAULT_TYPE):
         if rsi is None:
             return
 
-        alerts_map = get_alerts_for_chat(app, chat_id)
+        alerts_map = await get_alerts_for_chat(app, chat_id)
         key = f"{symbol}|{tf}"
         prev = alerts_map.get(key, {}).get("last_above", None)
 
@@ -1151,7 +1220,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     app = context.application
 
-    sub = get_sub(app, chat_id)
+    sub = await get_sub(app, chat_id)
     has_sub = bool(sub and sub.get("enabled"))
 
     text = (
@@ -1186,7 +1255,7 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data["await_interval"] = False
         return
 
-    sub = get_sub(app, chat_id)
+    sub = await get_sub(app, chat_id)
     has_sub = bool(sub and sub.get("enabled"))
     await update.message.reply_text("Используй кнопки меню:", reply_markup=main_menu_kb(has_sub))
 
@@ -1222,7 +1291,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     rate_limiter: RateLimiter = app.bot_data["rate_limiter"]
 
     data = query.data or ""
-    sub = get_sub(app, chat_id)
+    sub = await get_sub(app, chat_id)
     has_sub = bool(sub and sub.get("enabled"))
 
     if data == "MENU":
@@ -1258,7 +1327,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if data == "SUB_VIEW":
         context.user_data["await_interval"] = False
-        sub = get_sub(app, chat_id)
+        sub = await get_sub(app, chat_id)
         if not sub or not sub.get("enabled"):
             await query.edit_message_text("Подписка не создана.\nНажмите «Создать подписку».", reply_markup=main_menu_kb(False))
             return
@@ -1427,6 +1496,9 @@ async def post_init(app: Application):
     app.bot_data["http_session"] = aiohttp.ClientSession()
     app.bot_data["rate_limiter"] = RateLimiter()
     app.bot_data["state_lock"] = asyncio.Lock()
+    app.bot_data["perp_symbols_lock"] = asyncio.Lock()
+    app.bot_data["tickers_lock"] = asyncio.Lock()
+    app.bot_data["monitor_tasks"] = set()
     app.bot_data["state"] = load_state()
     app.bot_data["perp_symbols_cache"] = None
     app.bot_data["tickers_cache"] = None
@@ -1456,6 +1528,13 @@ async def post_init(app: Application):
 
 
 async def post_shutdown(app: Application):
+    monitor_tasks: Set[asyncio.Task] = app.bot_data.get("monitor_tasks", set())
+    for task in list(monitor_tasks):
+        if not task.done():
+            task.cancel()
+    if monitor_tasks:
+        await asyncio.gather(*monitor_tasks, return_exceptions=True)
+
     sess: aiohttp.ClientSession = app.bot_data.get("http_session")
     if sess:
         await sess.close()
@@ -1466,8 +1545,7 @@ async def post_shutdown(app: Application):
 # MAIN
 # =========================
 def main():
-    if not TELEGRAM_BOT_TOKEN:
-        raise RuntimeError("Не задан TELEGRAM_BOT_TOKEN в .env")
+    validate_config()
 
     app = (
         ApplicationBuilder()
