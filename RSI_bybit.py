@@ -744,6 +744,29 @@ async def update_alert_last_above(app: Application, chat_id: int, symbol: str, t
             save_state(state)
 
 
+async def delete_alert_state(app: Application, chat_id: int, symbol: str, tf: str) -> None:
+    if not validate_chat_id(chat_id):
+        return
+
+    valid_symbols = None
+    perp_cache = app.bot_data.get("perp_symbols_cache")
+    if perp_cache:
+        valid_symbols = set(perp_cache.value)
+
+    if not validate_symbol(symbol, valid_symbols):
+        return
+
+    state_lock: asyncio.Lock = app.bot_data["state_lock"]
+    async with state_lock:
+        state = app.bot_data.get("state") or {"subs": {}, "alerts": {}}
+        alerts = state.setdefault("alerts", {}).setdefault(str(chat_id), {})
+        key = f"{symbol}|{tf}"
+        if key in alerts:
+            alerts.pop(key, None)
+            app.bot_data["state"] = state
+            save_state(state)
+
+
 # =========================
 # CACHES
 # =========================
@@ -829,6 +852,13 @@ def schedule_alert(app: Application, chat_id: int, symbol: str, tf: str, tf_labe
         name=name,
         data={"symbol": symbol, "tf": tf, "tf_label": tf_label},
     )
+
+
+def unschedule_alert(app: Application, chat_id: int, symbol: str, tf: str) -> None:
+    name = get_alert_job_name(chat_id, symbol, tf)
+    jobs = app.job_queue.get_jobs_by_name(name)
+    for j in jobs:
+        j.schedule_removal()
 
 
 def restore_alerts(app: Application) -> None:
@@ -1015,6 +1045,8 @@ async def alert_job_callback(context: ContextTypes.DEFAULT_TYPE):
                     chat_id=chat_id,
                     text=f"🔔 ALERT {symbol} RSI{RSI_PERIOD}({tf_label}) ≈ {ALERT_THRESHOLD}\nCurrent RSI: {rsi:.2f}",
                 )
+                unschedule_alert(app, chat_id, symbol, tf)
+                await delete_alert_state(app, chat_id, symbol, tf)
             return
 
         # Crossing detection or exact hit
@@ -1026,6 +1058,8 @@ async def alert_job_callback(context: ContextTypes.DEFAULT_TYPE):
                 chat_id=chat_id,
                 text=f"🔔 ALERT {symbol} RSI{RSI_PERIOD}({tf_label}) {extra}\nCurrent RSI: {rsi:.2f}",
             )
+            unschedule_alert(app, chat_id, symbol, tf)
+            await delete_alert_state(app, chat_id, symbol, tf)
 
         await update_alert_last_above(app, chat_id, symbol, tf, now_above)
 
