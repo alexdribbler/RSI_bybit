@@ -9,6 +9,7 @@ import random
 from math import ceil
 import time
 import math
+from decimal import Decimal, InvalidOperation
 from dataclasses import dataclass
 from datetime import datetime
 from io import BytesIO
@@ -77,6 +78,7 @@ ALERT_CHECK_SEC = int(os.getenv("ALERT_CHECK_SEC", "300"))  # check every 5 minu
 ALERT_EPS = float(os.getenv("ALERT_EPS", "0.10"))  # "equals threshold" tolerance
 ALERT_LONG_THRESHOLD = float(os.getenv("ALERT_LONG_THRESHOLD", "40"))
 ALERT_SHORT_THRESHOLD = float(os.getenv("ALERT_SHORT_THRESHOLD", "60"))
+PRICE_ALERT_CHECK_SEC = int(os.getenv("PRICE_ALERT_CHECK_SEC", "180"))
 ALERT_ERROR_THROTTLE_MIN = int(os.getenv("ALERT_ERROR_THROTTLE_MIN", "30"))
 ALERT_ERROR_NOTIFY_TTL_HOURS = float(os.getenv("ALERT_ERROR_NOTIFY_TTL_HOURS", "24"))
 MAX_ALERTS_PER_CHAT = int(os.getenv("MAX_ALERTS_PER_CHAT", "50"))
@@ -143,6 +145,8 @@ def validate_config() -> None:
         errors.append("LEVERAGE must be > 0")
     if ALERT_CHECK_SEC <= 0:
         errors.append("ALERT_CHECK_SEC must be > 0")
+    if PRICE_ALERT_CHECK_SEC <= 0:
+        errors.append("PRICE_ALERT_CHECK_SEC must be > 0")
     if ALERT_ERROR_THROTTLE_MIN <= 0:
         errors.append("ALERT_ERROR_THROTTLE_MIN must be > 0")
     if ALERT_ERROR_NOTIFY_TTL_HOURS <= 0:
@@ -222,7 +226,7 @@ def load_state() -> dict:
             logging.warning("Invalid state file moved to %s", bad_name)
     except Exception as e:
         logging.warning("Failed to load state: %s", e)
-    return {"subs": {}, "alerts": {}, "pair_rsi_alerts": {}}
+    return {"subs": {}, "alerts": {}, "pair_rsi_alerts": {}, "price_alerts": {}}
 
 
 def save_state_json(state_json: str) -> None:
@@ -258,7 +262,10 @@ def validate_state(state: object) -> bool:
     subs = state.get("subs", {})
     alerts = state.get("alerts", {})
     pair_alerts = state.get("pair_rsi_alerts", {})
+    price_alerts = state.get("price_alerts", {})
     if not isinstance(subs, dict) or not isinstance(alerts, dict) or not isinstance(pair_alerts, dict):
+        return False
+    if not isinstance(price_alerts, dict):
         return False
     for chat_id, sub in subs.items():
         if not isinstance(chat_id, str) or not isinstance(sub, dict):
@@ -293,6 +300,19 @@ def validate_state(state: object) -> bool:
                 return False
             if alert.get("mode") not in {"LOW", "HIGH"}:
                 return False
+    for chat_id, amap in price_alerts.items():
+        if not isinstance(chat_id, str) or not isinstance(amap, dict):
+            return False
+        for _, alert in amap.items():
+            if not isinstance(alert, dict):
+                return False
+            if not isinstance(alert.get("symbol"), str):
+                return False
+            price = alert.get("price")
+            if not isinstance(price, (int, float)):
+                return False
+            if alert.get("direction") not in {"UP", "DOWN"}:
+                return False
     return True
 
 
@@ -306,6 +326,10 @@ def get_alert_job_name(chat_id: int, symbol: str, tf: str) -> str:
 
 def get_pair_rsi_alert_job_name(chat_id: int) -> str:
     return f"pair_rsi_alert:{chat_id}"
+
+
+def get_price_alert_job_name(chat_id: int, key: str) -> str:
+    return f"price_alert:{chat_id}:{key}"
 
 
 # =========================
@@ -371,6 +395,38 @@ def normalize_symbol(raw: str) -> Optional[str]:
     if not cleaned.endswith("USDT"):
         return None
     return cleaned
+
+
+def parse_price_input(raw: str) -> Optional[Decimal]:
+    if not isinstance(raw, str):
+        return None
+    cleaned = raw.strip().replace(",", ".")
+    if not cleaned:
+        return None
+    try:
+        value = Decimal(cleaned)
+    except InvalidOperation:
+        return None
+    if not value.is_finite() or value <= 0:
+        return None
+    return value
+
+
+def normalize_price_text(value: Decimal) -> str:
+    text = format(value, "f")
+    if "." in text:
+        text = text.rstrip("0").rstrip(".")
+    return text or "0"
+
+
+def needs_price_confirmation(current_price: float, target_price: Decimal) -> bool:
+    if current_price <= 0:
+        return False
+    target_value = float(target_price)
+    if current_price < 1:
+        ratio = target_value / current_price
+        return ratio >= 10 or ratio <= 0.1
+    return False
 
 
 # =========================
@@ -1002,6 +1058,19 @@ def pair_info_actions_kb(symbol: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         [
             [InlineKeyboardButton("🔔 Отслеживать пару по RSI6", callback_data=f"PAIRTRACK|{symbol}")],
+            [InlineKeyboardButton("💰 Создать alert по цене", callback_data=f"PRICE_ALERT|{symbol}")],
+            [InlineKeyboardButton("⬅️ Меню", callback_data="MENU")],
+        ]
+    )
+
+
+def price_alert_confirm_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton("✅ Да, верно", callback_data="PRICE_ALERT_CONFIRM|YES"),
+                InlineKeyboardButton("✏️ Изменить", callback_data="PRICE_ALERT_CONFIRM|NO"),
+            ],
             [InlineKeyboardButton("⬅️ Меню", callback_data="MENU")],
         ]
     )
@@ -1068,7 +1137,12 @@ async def get_sub(app: Application, chat_id: int) -> Optional[dict]:
         return None
     state_lock: asyncio.Lock = app.bot_data["state_lock"]
     async with state_lock:
-        state = app.bot_data.get("state") or {"subs": {}, "alerts": {}}
+        state = app.bot_data.get("state") or {
+            "subs": {},
+            "alerts": {},
+            "pair_rsi_alerts": {},
+            "price_alerts": {},
+        }
         subs = state.get("subs", {})
         return subs.get(str(chat_id))
 
@@ -1080,7 +1154,12 @@ async def set_sub(app: Application, chat_id: int, interval_min: int, enabled: bo
     
     state_lock: asyncio.Lock = app.bot_data["state_lock"]
     async with state_lock:
-        state = app.bot_data.get("state") or {"subs": {}, "alerts": {}}
+        state = app.bot_data.get("state") or {
+            "subs": {},
+            "alerts": {},
+            "pair_rsi_alerts": {},
+            "price_alerts": {},
+        }
         state.setdefault("subs", {})
         state["subs"][str(chat_id)] = {"interval_min": int(interval_min), "enabled": bool(enabled)}
         app.bot_data["state"] = state
@@ -1093,7 +1172,12 @@ async def delete_sub(app: Application, chat_id: int) -> None:
     
     state_lock: asyncio.Lock = app.bot_data["state_lock"]
     async with state_lock:
-        state = app.bot_data.get("state") or {"subs": {}, "alerts": {}}
+        state = app.bot_data.get("state") or {
+            "subs": {},
+            "alerts": {},
+            "pair_rsi_alerts": {},
+            "price_alerts": {},
+        }
         subs = state.setdefault("subs", {})
         subs.pop(str(chat_id), None)
         save_state_json(json.dumps(state, ensure_ascii=False, indent=2))
@@ -1112,7 +1196,7 @@ async def get_pair_rsi_alerts_for_chat(app: Application, chat_id: int) -> Dict[s
         return {}
     state_lock: asyncio.Lock = app.bot_data["state_lock"]
     async with state_lock:
-        state = app.bot_data.get("state") or {"subs": {}, "alerts": {}, "pair_rsi_alerts": {}}
+        state = app.bot_data.get("state") or {"subs": {}, "alerts": {}, "pair_rsi_alerts": {}, "price_alerts": {}}
         alerts = state.get("pair_rsi_alerts", {})
         return copy.deepcopy(alerts.get(str(chat_id), {}))
 
@@ -1149,7 +1233,12 @@ async def set_pair_rsi_alert_state(
 
     state_lock: asyncio.Lock = app.bot_data["state_lock"]
     async with state_lock:
-        state = app.bot_data.get("state") or {"subs": {}, "alerts": {}, "pair_rsi_alerts": {}}
+        state = app.bot_data.get("state") or {
+            "subs": {},
+            "alerts": {},
+            "pair_rsi_alerts": {},
+            "price_alerts": {},
+        }
         alerts_all = state.setdefault("pair_rsi_alerts", {})
         alerts = alerts_all.setdefault(str(chat_id), {})
         is_new = key not in alerts
@@ -1171,12 +1260,87 @@ async def set_pair_rsi_alert_state(
     return True, None
 
 
+async def get_price_alerts_for_chat(app: Application, chat_id: int) -> Dict[str, dict]:
+    if not validate_chat_id(chat_id):
+        return {}
+    state_lock: asyncio.Lock = app.bot_data["state_lock"]
+    async with state_lock:
+        state = app.bot_data.get("state") or {"subs": {}, "alerts": {}, "pair_rsi_alerts": {}, "price_alerts": {}}
+        alerts = state.get("price_alerts", {})
+        return copy.deepcopy(alerts.get(str(chat_id), {}))
+
+
+async def set_price_alert_state(
+    app: Application,
+    chat_id: int,
+    symbol: str,
+    price_value: Decimal,
+    direction: str,
+    valid_symbols: Optional[Set[str]] = None,
+) -> Tuple[bool, Optional[str], Optional[str]]:
+    if not validate_chat_id(chat_id):
+        return False, "Некорректный chat_id.", None
+
+    if direction not in {"UP", "DOWN"}:
+        return False, "Некорректное направление.", None
+
+    if valid_symbols is None or not valid_symbols:
+        valid_symbols = await get_valid_symbols_with_fallback(app)
+    if not valid_symbols:
+        return False, "Whitelist временно недоступен. Попробуйте позже.", None
+
+    if not validate_symbol(symbol, valid_symbols):
+        return False, "Некорректный символ.", None
+
+    price_text = normalize_price_text(price_value)
+
+    state_lock: asyncio.Lock = app.bot_data["state_lock"]
+    async with state_lock:
+        state = app.bot_data.get("state") or {"subs": {}, "alerts": {}, "pair_rsi_alerts": {}, "price_alerts": {}}
+        alerts_all = state.setdefault("price_alerts", {})
+        alerts = alerts_all.setdefault(str(chat_id), {})
+        if len(alerts) >= MAX_ALERTS_PER_CHAT:
+            return False, "Достигнут лимит алертов в этом чате.", None
+        total_alerts = sum(len(a) for a in alerts_all.values())
+        if total_alerts >= MAX_ALERTS_GLOBAL:
+            return False, "Достигнут глобальный лимит алертов.", None
+        key = f"{symbol}|{price_text}"
+        alerts[key] = {
+            "symbol": symbol,
+            "price": float(price_value),
+            "price_text": price_text,
+            "direction": direction,
+            "created_at": time.time(),
+        }
+        app.bot_data["state"] = state
+        save_state_json(json.dumps(state, ensure_ascii=False, indent=2))
+    return True, None, key
+
+
+async def delete_price_alert_state(app: Application, chat_id: int, key: str) -> None:
+    if not validate_chat_id(chat_id):
+        return
+    state_lock: asyncio.Lock = app.bot_data["state_lock"]
+    async with state_lock:
+        state = app.bot_data.get("state") or {"subs": {}, "alerts": {}, "pair_rsi_alerts": {}, "price_alerts": {}}
+        alerts = state.setdefault("price_alerts", {}).setdefault(str(chat_id), {})
+        if key in alerts:
+            alerts.pop(key, None)
+            app.bot_data["state"] = state
+            save_state_json(json.dumps(state, ensure_ascii=False, indent=2))
+
+
 async def delete_pair_rsi_alert_state(app: Application, chat_id: int, key: str) -> None:
     if not validate_chat_id(chat_id):
         return
     state_lock: asyncio.Lock = app.bot_data["state_lock"]
     async with state_lock:
-        state = app.bot_data.get("state") or {"subs": {}, "alerts": {}, "pair_rsi_alerts": {}}
+        state = app.bot_data.get("state") or {
+            "subs": {},
+            "alerts": {},
+            "pair_rsi_alerts": {},
+            "price_alerts": {},
+        }
         alerts = state.setdefault("pair_rsi_alerts", {}).setdefault(str(chat_id), {})
         if key in alerts:
             alerts.pop(key, None)
@@ -1190,7 +1354,12 @@ async def get_alerts_for_chat(app: Application, chat_id: int) -> Dict[str, dict]
         return {}
     state_lock: asyncio.Lock = app.bot_data["state_lock"]
     async with state_lock:
-        state = app.bot_data.get("state") or {"subs": {}, "alerts": {}}
+        state = app.bot_data.get("state") or {
+            "subs": {},
+            "alerts": {},
+            "pair_rsi_alerts": {},
+            "price_alerts": {},
+        }
         alerts = state.get("alerts", {})
         return copy.deepcopy(alerts.get(str(chat_id), {}))
 
@@ -1266,7 +1435,12 @@ async def set_alert_state(
 
     state_lock: asyncio.Lock = app.bot_data["state_lock"]
     async with state_lock:
-        state = app.bot_data.get("state") or {"subs": {}, "alerts": {}}
+        state = app.bot_data.get("state") or {
+            "subs": {},
+            "alerts": {},
+            "pair_rsi_alerts": {},
+            "price_alerts": {},
+        }
         now = time.time()
         changed = prune_expired_alerts(state, now=now)
         alerts_all = state.setdefault("alerts", {})
@@ -1308,7 +1482,12 @@ async def update_alert_last_above(app: Application, chat_id: int, symbol: str, t
     
     state_lock: asyncio.Lock = app.bot_data["state_lock"]
     async with state_lock:
-        state = app.bot_data.get("state") or {"subs": {}, "alerts": {}}
+        state = app.bot_data.get("state") or {
+            "subs": {},
+            "alerts": {},
+            "pair_rsi_alerts": {},
+            "price_alerts": {},
+        }
         alerts = state.setdefault("alerts", {}).setdefault(str(chat_id), {})
         key = f"{symbol}|{tf}"
         if key in alerts:
@@ -1332,7 +1511,12 @@ async def update_alert_created_at(app: Application, chat_id: int, symbol: str, t
 
     state_lock: asyncio.Lock = app.bot_data["state_lock"]
     async with state_lock:
-        state = app.bot_data.get("state") or {"subs": {}, "alerts": {}}
+        state = app.bot_data.get("state") or {
+            "subs": {},
+            "alerts": {},
+            "pair_rsi_alerts": {},
+            "price_alerts": {},
+        }
         alerts = state.setdefault("alerts", {}).setdefault(str(chat_id), {})
         key = f"{symbol}|{tf}"
         if key in alerts:
@@ -1360,7 +1544,12 @@ async def delete_alert_state(
 
     state_lock: asyncio.Lock = app.bot_data["state_lock"]
     async with state_lock:
-        state = app.bot_data.get("state") or {"subs": {}, "alerts": {}}
+        state = app.bot_data.get("state") or {
+            "subs": {},
+            "alerts": {},
+            "pair_rsi_alerts": {},
+            "price_alerts": {},
+        }
         alerts = state.setdefault("alerts", {}).setdefault(str(chat_id), {})
         key = f"{symbol}|{tf}"
         if key in alerts:
@@ -1502,10 +1691,44 @@ def unschedule_pair_rsi_alerts(app: Application, chat_id: int) -> None:
         j.schedule_removal()
 
 
+def schedule_price_alert(app: Application, chat_id: int, key: str, symbol: str, target_price: float, direction: str) -> None:
+    if not validate_chat_id(chat_id):
+        return
+    name = get_price_alert_job_name(chat_id, key)
+    jobs = app.job_queue.get_jobs_by_name(name)
+    for j in jobs:
+        j.schedule_removal()
+    app.job_queue.run_repeating(
+        price_alert_job_callback,
+        interval=PRICE_ALERT_CHECK_SEC,
+        first=2,
+        chat_id=chat_id,
+        name=name,
+        data={
+            "key": key,
+            "symbol": symbol,
+            "target_price": float(target_price),
+            "direction": direction,
+        },
+    )
+
+
+def unschedule_price_alert(app: Application, chat_id: int, key: str) -> None:
+    name = get_price_alert_job_name(chat_id, key)
+    jobs = app.job_queue.get_jobs_by_name(name)
+    for j in jobs:
+        j.schedule_removal()
+
+
 async def restore_alerts(app: Application) -> None:
     state_lock: asyncio.Lock = app.bot_data["state_lock"]
     async with state_lock:
-        state = app.bot_data.get("state") or {"subs": {}, "alerts": {}}
+        state = app.bot_data.get("state") or {
+            "subs": {},
+            "alerts": {},
+            "pair_rsi_alerts": {},
+            "price_alerts": {},
+        }
         changed = prune_expired_alerts(state)
         alerts_all = copy.deepcopy(state.get("alerts", {}) or {})
         if changed:
@@ -1536,7 +1759,12 @@ async def restore_alerts(app: Application) -> None:
 async def restore_pair_rsi_alerts(app: Application) -> None:
     state_lock: asyncio.Lock = app.bot_data["state_lock"]
     async with state_lock:
-        state = app.bot_data.get("state") or {"subs": {}, "alerts": {}, "pair_rsi_alerts": {}}
+        state = app.bot_data.get("state") or {
+            "subs": {},
+            "alerts": {},
+            "pair_rsi_alerts": {},
+            "price_alerts": {},
+        }
         alerts_all = copy.deepcopy(state.get("pair_rsi_alerts", {}) or {})
 
     for chat_id_str, amap in alerts_all.items():
@@ -1549,6 +1777,35 @@ async def restore_pair_rsi_alerts(app: Application) -> None:
         if not isinstance(amap, dict) or not amap:
             continue
         schedule_pair_rsi_alerts(app, chat_id)
+
+
+async def restore_price_alerts(app: Application) -> None:
+    state_lock: asyncio.Lock = app.bot_data["state_lock"]
+    async with state_lock:
+        state = app.bot_data.get("state") or {
+            "subs": {},
+            "alerts": {},
+            "pair_rsi_alerts": {},
+            "price_alerts": {},
+        }
+        alerts_all = copy.deepcopy(state.get("price_alerts", {}) or {})
+
+    for chat_id_str, amap in alerts_all.items():
+        try:
+            chat_id = int(chat_id_str)
+            if not validate_chat_id(chat_id):
+                continue
+        except Exception:
+            continue
+        if not isinstance(amap, dict) or not amap:
+            continue
+        for key, entry in amap.items():
+            symbol = entry.get("symbol")
+            target = entry.get("price")
+            direction = entry.get("direction")
+            if not symbol or target is None or direction not in {"UP", "DOWN"}:
+                continue
+            schedule_price_alert(app, chat_id, key, symbol, float(target), direction)
 
 
 # =========================
@@ -1848,6 +2105,56 @@ async def alert_job_callback(context: ContextTypes.DEFAULT_TYPE):
                 logging.error("Failed to send alert error message to chat %s", chat_id)
 
 
+async def price_alert_job_callback(context: ContextTypes.DEFAULT_TYPE):
+    job = context.job
+    chat_id = job.chat_id
+    app = context.application
+    data = job.data or {}
+
+    if not validate_chat_id(chat_id):
+        return
+
+    key = data.get("key")
+    symbol = data.get("symbol")
+    target_price = data.get("target_price")
+    direction = data.get("direction")
+    if not key or not symbol or target_price is None or direction not in {"UP", "DOWN"}:
+        if key:
+            unschedule_price_alert(app, chat_id, key)
+            await delete_price_alert_state(app, chat_id, key)
+        return
+
+    alerts_map = await get_price_alerts_for_chat(app, chat_id)
+    entry = alerts_map.get(key)
+    if not entry:
+        unschedule_price_alert(app, chat_id, key)
+        return
+
+    try:
+        session: aiohttp.ClientSession = app.bot_data["http_session"]
+        rate_limiter: RateLimiter = app.bot_data["rate_limiter"]
+        current_price = await get_last_price(session, rate_limiter, symbol)
+        target_value = float(entry.get("price", target_price))
+        direction = entry.get("direction", direction)
+        if direction == "UP":
+            condition_met = current_price >= target_value
+        else:
+            condition_met = current_price <= target_value
+        if condition_met:
+            price_label = normalize_price_text(Decimal(str(target_value)))
+            await app.bot.send_message(
+                chat_id=chat_id,
+                text=(
+                    f"🔔 Цена достигла цели для {symbol}: {price_label}\n"
+                    f"Текущая цена: {current_price}"
+                ),
+            )
+            unschedule_price_alert(app, chat_id, key)
+            await delete_price_alert_state(app, chat_id, key)
+    except Exception as e:
+        logging.exception("price alert job failed for %s: %s", symbol, e)
+
+
 async def pair_rsi_alert_job_callback(context: ContextTypes.DEFAULT_TYPE):
     chat_id = context.job.chat_id
     app = context.application
@@ -1941,6 +2248,70 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     app = context.application
 
+    if context.user_data.get("price_alert_confirm"):
+        await update.message.reply_text(
+            "Подтвердите цену кнопками ниже или вернитесь в меню.",
+            reply_markup=price_alert_confirm_kb(),
+        )
+        return
+
+    if context.user_data.get("await_price_alert"):
+        raw_price = (update.message.text or "").strip()
+        price_value = parse_price_input(raw_price)
+        if not price_value:
+            await update.message.reply_text("Введите корректную цену, например 0.0015 или 25000.")
+            return
+
+        symbol = context.user_data.get("price_alert_symbol")
+        if not symbol:
+            context.user_data["await_price_alert"] = False
+            await update.message.reply_text("Не удалось определить символ. Начните заново через меню.")
+            return
+
+        valid_symbols = await get_valid_symbols_with_fallback(app)
+        if not valid_symbols:
+            await update.message.reply_text("Whitelist временно недоступен. Попробуйте позже.")
+            return
+        if not validate_symbol(symbol, valid_symbols):
+            await update.message.reply_text("Некорректный символ. Попробуйте заново через меню.")
+            context.user_data["await_price_alert"] = False
+            return
+
+        session: aiohttp.ClientSession = app.bot_data["http_session"]
+        rate_limiter: RateLimiter = app.bot_data["rate_limiter"]
+        try:
+            current_price = await get_last_price(session, rate_limiter, symbol)
+        except Exception as e:
+            logging.exception("Failed to fetch last price for %s: %s", symbol, e)
+            await update.message.reply_text("Не удалось получить текущую цену. Попробуйте позже.")
+            return
+
+        direction = "UP" if float(price_value) >= current_price else "DOWN"
+        price_text = normalize_price_text(price_value)
+        if needs_price_confirmation(current_price, price_value):
+            context.user_data["await_price_alert"] = False
+            context.user_data["price_alert_confirm"] = {
+                "symbol": symbol,
+                "price_value": str(price_value),
+                "price_text": price_text,
+                "direction": direction,
+                "current_price": current_price,
+            }
+            await update.message.reply_text(
+                (
+                    f"Текущая цена {symbol}: {current_price}\n"
+                    f"Вы ввели {price_text}. Подтвердите, что значение введено верно."
+                ),
+                reply_markup=price_alert_confirm_kb(),
+            )
+            return
+
+        created = await apply_price_alert(app, chat_id, symbol, price_value, direction, valid_symbols)
+        if created:
+            context.user_data["await_price_alert"] = False
+            context.user_data.pop("price_alert_symbol", None)
+        return
+
     if context.user_data.get("await_pair_info"):
         raw_symbol = (update.message.text or "").strip()
         symbol = normalize_symbol(raw_symbol)
@@ -2023,6 +2394,31 @@ async def apply_interval(app: Application, chat_id: int, minutes: int):
         await app.bot.send_message(chat_id=chat_id, text=f"Ошибка при первом запуске: {e}")
 
 
+async def apply_price_alert(
+    app: Application,
+    chat_id: int,
+    symbol: str,
+    price_value: Decimal,
+    direction: str,
+    valid_symbols: Optional[Set[str]] = None,
+) -> bool:
+    ok, err, key = await set_price_alert_state(app, chat_id, symbol, price_value, direction, valid_symbols)
+    if not ok:
+        await app.bot.send_message(chat_id=chat_id, text=err or "Не удалось создать алерт по цене.")
+        return False
+    price_text = normalize_price_text(price_value)
+    schedule_price_alert(app, chat_id, key, symbol, float(price_value), direction)
+    direction_label = "выше" if direction == "UP" else "ниже"
+    await app.bot.send_message(
+        chat_id=chat_id,
+        text=(
+            f"✅ Alert по цене создан: {symbol} {direction_label} {price_text} "
+            f"(проверка каждые {PRICE_ALERT_CHECK_SEC // 60} мин)"
+        ),
+    )
+    return True
+
+
 async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -2039,6 +2435,9 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data == "MENU":
         context.user_data["await_interval"] = False
         context.user_data["await_pair_info"] = False
+        context.user_data["await_price_alert"] = False
+        context.user_data.pop("price_alert_symbol", None)
+        context.user_data.pop("price_alert_confirm", None)
         context.user_data.pop("pair_track_symbol", None)
         context.user_data.pop("pair_track_tfs", None)
         await query.edit_message_text("Меню RSI-бота:", reply_markup=main_menu_kb(has_sub))
@@ -2047,6 +2446,9 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data == "SUB_CREATE":
         context.user_data["await_interval"] = True
         context.user_data["await_pair_info"] = False
+        context.user_data["await_price_alert"] = False
+        context.user_data.pop("price_alert_symbol", None)
+        context.user_data.pop("price_alert_confirm", None)
         await query.edit_message_text(
             "Введите интервал в минутах (например 15) сообщением в чат — или выберите кнопкой:",
             reply_markup=interval_picker_kb(),
@@ -2094,6 +2496,9 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data == "RUN_NOW":
         context.user_data["await_interval"] = False
         context.user_data["await_pair_info"] = False
+        context.user_data["await_price_alert"] = False
+        context.user_data.pop("price_alert_symbol", None)
+        context.user_data.pop("price_alert_confirm", None)
         await app.bot.send_message(chat_id=chat_id, text="Собираю данные…")
         try:
             await run_monitor_once(app, chat_id)
@@ -2105,16 +2510,93 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data == "PAIR_INFO":
         context.user_data["await_pair_info"] = True
         context.user_data["await_interval"] = False
+        context.user_data["await_price_alert"] = False
+        context.user_data.pop("price_alert_symbol", None)
+        context.user_data.pop("price_alert_confirm", None)
         context.user_data.pop("pair_track_symbol", None)
         context.user_data.pop("pair_track_tfs", None)
         await query.edit_message_text("Введите торговую пару (пример BTCUSDT или BTC/USDT):")
         return
+
+    if data.startswith("PRICE_ALERT|"):
+        try:
+            _, symbol = data.split("|", 1)
+        except ValueError:
+            return
+        valid_symbols = await get_valid_symbols_with_fallback(app)
+        if not valid_symbols:
+            await app.bot.send_message(chat_id=chat_id, text="Whitelist временно недоступен.")
+            return
+        if not validate_symbol(symbol, valid_symbols):
+            await app.bot.send_message(chat_id=chat_id, text="Некорректный символ.")
+            return
+        try:
+            current_price = await get_last_price(session, rate_limiter, symbol)
+        except Exception as e:
+            logging.exception("Failed to fetch last price for %s: %s", symbol, e)
+            await app.bot.send_message(chat_id=chat_id, text="Не удалось получить текущую цену. Попробуйте позже.")
+            return
+
+        context.user_data["await_price_alert"] = True
+        context.user_data["await_pair_info"] = False
+        context.user_data["price_alert_symbol"] = symbol
+        context.user_data.pop("price_alert_confirm", None)
+        await query.edit_message_text(
+            f"Введите цену для alert по {symbol}.\nТекущая цена: {current_price}",
+        )
+        return
+
+    if data.startswith("PRICE_ALERT_CONFIRM|"):
+        parts = data.split("|")
+        if len(parts) != 2:
+            return
+        action = parts[1]
+        confirm_data = context.user_data.get("price_alert_confirm")
+        if not confirm_data:
+            await app.bot.send_message(chat_id=chat_id, text="Нет активного подтверждения.")
+            return
+        if action == "NO":
+            symbol = confirm_data.get("symbol")
+            current_price = confirm_data.get("current_price")
+            if not symbol:
+                await app.bot.send_message(chat_id=chat_id, text="Данные подтверждения устарели. Начните заново.")
+                context.user_data.pop("price_alert_confirm", None)
+                return
+            context.user_data["await_price_alert"] = True
+            context.user_data["price_alert_symbol"] = symbol
+            context.user_data.pop("price_alert_confirm", None)
+            await query.edit_message_text(
+                f"Введите новую цену для {symbol}.\nТекущая цена: {current_price}",
+            )
+            return
+        if action == "YES":
+            symbol = confirm_data.get("symbol")
+            price_raw = confirm_data.get("price_value")
+            direction = confirm_data.get("direction")
+            if not symbol or not price_raw or direction not in {"UP", "DOWN"}:
+                await app.bot.send_message(chat_id=chat_id, text="Данные подтверждения устарели. Начните заново.")
+                context.user_data.pop("price_alert_confirm", None)
+                return
+            price_value = parse_price_input(str(price_raw))
+            if not price_value:
+                await app.bot.send_message(chat_id=chat_id, text="Некорректная цена. Начните заново.")
+                context.user_data.pop("price_alert_confirm", None)
+                return
+            created = await apply_price_alert(app, chat_id, symbol, price_value, direction)
+            if created:
+                context.user_data["await_price_alert"] = False
+                context.user_data.pop("price_alert_symbol", None)
+                context.user_data.pop("price_alert_confirm", None)
+            return
 
     if data.startswith("PAIRTRACK|"):
         try:
             _, symbol = data.split("|", 1)
         except ValueError:
             return
+        context.user_data["await_price_alert"] = False
+        context.user_data.pop("price_alert_symbol", None)
+        context.user_data.pop("price_alert_confirm", None)
         valid_symbols = await get_valid_symbols_with_fallback(app)
         if not valid_symbols:
             await app.bot.send_message(chat_id=chat_id, text="Whitelist временно недоступен.")
@@ -2392,6 +2874,7 @@ async def post_init(app: Application):
     app.bot_data["monitor_tasks"] = set()
     app.bot_data["state"] = load_state()
     app.bot_data["state"].setdefault("pair_rsi_alerts", {})
+    app.bot_data["state"].setdefault("price_alerts", {})
     app.bot_data["perp_symbols_cache"] = None
     app.bot_data["tickers_cache"] = None
     app.bot_data["alert_cooldowns"] = {}
@@ -2422,6 +2905,9 @@ async def post_init(app: Application):
     await restore_pair_rsi_alerts(app)
     logging.info("Restored pair RSI alerts")
 
+    await restore_price_alerts(app)
+    logging.info("Restored price alerts")
+
 
 async def post_shutdown(app: Application):
     monitor_tasks: Set[asyncio.Task] = app.bot_data.get("monitor_tasks", set())
@@ -2439,7 +2925,12 @@ async def post_shutdown(app: Application):
     sess: aiohttp.ClientSession = app.bot_data.get("http_session")
     if sess:
         await sess.close()
-    save_state(app.bot_data.get("state", {"subs": {}, "alerts": {}}))
+    save_state(
+        app.bot_data.get(
+            "state",
+            {"subs": {}, "alerts": {}, "pair_rsi_alerts": {}, "price_alerts": {}},
+        )
+    )
 
 
 # =========================
