@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import asyncio
+import copy
 import contextlib
 import json
 import logging
@@ -7,6 +8,7 @@ import os
 import random
 from math import ceil
 import time
+import math
 from dataclasses import dataclass
 from datetime import datetime
 from io import BytesIO
@@ -65,6 +67,7 @@ ALERT_CHECK_SEC = int(os.getenv("ALERT_CHECK_SEC", "300"))  # check every 5 minu
 ALERT_EPS = float(os.getenv("ALERT_EPS", "0.10"))  # "equals threshold" tolerance
 ALERT_LONG_THRESHOLD = float(os.getenv("ALERT_LONG_THRESHOLD", "40"))
 ALERT_SHORT_THRESHOLD = float(os.getenv("ALERT_SHORT_THRESHOLD", "60"))
+ALERT_ERROR_THROTTLE_MIN = int(os.getenv("ALERT_ERROR_THROTTLE_MIN", "30"))
 
 MAX_SYMBOLS = int(os.getenv("MAX_SYMBOLS", "200"))
 MAX_CONCURRENCY = int(os.getenv("MAX_CONCURRENCY", "20"))  # Increased from 10 for better performance
@@ -94,6 +97,7 @@ ERROR_RATE_THRESHOLD = 0.3  # 30%
 RATE_LIMIT_DELAY = 1.0  # Initial delay in seconds
 RATE_LIMIT_MAX_DELAY = 60.0  # Maximum delay
 RATE_LIMIT_QUEUE_TIMEOUT = 300  # Maximum time to wait in queue (5 minutes)
+RATE_LIMIT_MIN_SPACING = float(os.getenv("RATE_LIMIT_MIN_SPACING", "0.1"))
 
 # Timeout for monitor scanning (seconds)
 DEFAULT_MONITOR_TIMEOUT = max(
@@ -103,7 +107,7 @@ DEFAULT_MONITOR_TIMEOUT = max(
             MAX_SYMBOLS
             / max(1, MAX_CONCURRENCY)
             * len(TIMEFRAMES)
-            * RATE_LIMIT_MAX_DELAY
+            * max(RATE_LIMIT_DELAY, RATE_LIMIT_MIN_SPACING)
         )
     ),
 )
@@ -123,18 +127,24 @@ def validate_config() -> None:
         errors.append("LEVERAGE must be > 0")
     if ALERT_CHECK_SEC <= 0:
         errors.append("ALERT_CHECK_SEC must be > 0")
+    if ALERT_ERROR_THROTTLE_MIN <= 0:
+        errors.append("ALERT_ERROR_THROTTLE_MIN must be > 0")
     if MAX_SYMBOLS <= 0:
         errors.append("MAX_SYMBOLS must be > 0")
     if MAX_CONCURRENCY <= 0:
         errors.append("MAX_CONCURRENCY must be > 0")
     if KLINE_LIMIT <= 0:
         errors.append("KLINE_LIMIT must be > 0")
+    if RSI_PERIOD <= 0:
+        errors.append("RSI_PERIOD must be > 0")
     if RATE_LIMIT_DELAY <= 0:
         errors.append("RATE_LIMIT_DELAY must be > 0")
     if RATE_LIMIT_MAX_DELAY < RATE_LIMIT_DELAY:
         errors.append("RATE_LIMIT_MAX_DELAY must be >= RATE_LIMIT_DELAY")
     if RATE_LIMIT_QUEUE_TIMEOUT <= 0:
         errors.append("RATE_LIMIT_QUEUE_TIMEOUT must be > 0")
+    if RATE_LIMIT_MIN_SPACING <= 0:
+        errors.append("RATE_LIMIT_MIN_SPACING must be > 0")
     if MONITOR_TIMEOUT <= 0:
         errors.append("MONITOR_TIMEOUT must be > 0")
 
@@ -277,11 +287,12 @@ class RateLimiter:
             async with asyncio.timeout(RATE_LIMIT_QUEUE_TIMEOUT):
                 async with self._lock:
                     now = time.time()
-                    if self._rate_limited:
-                        wait_time = self._delay - (now - self._last_request)
-                        if wait_time > 0:
-                            jitter = random.uniform(0.7, 1.3)
-                            await asyncio.sleep(wait_time * jitter)
+                    base_spacing = RATE_LIMIT_MIN_SPACING
+                    target_delay = self._delay if self._rate_limited else base_spacing
+                    wait_time = target_delay - (now - self._last_request)
+                    if wait_time > 0:
+                        jitter = random.uniform(0.7, 1.3) if self._rate_limited else 1.0
+                        await asyncio.sleep(wait_time * jitter)
                     self._last_request = time.time()
         except asyncio.TimeoutError:
             raise BybitAPIError(f"Rate limiter queue timeout after {RATE_LIMIT_QUEUE_TIMEOUT}s")
@@ -466,7 +477,10 @@ async def get_kline_closes(session: aiohttp.ClientSession, rate_limiter: RateLim
         if not isinstance(c, list) or len(c) < 5:
             continue
         try:
-            closes.append(float(c[4]))
+            value = float(c[4])
+            if not math.isfinite(value):
+                continue
+            closes.append(value)
         except Exception:
             continue
     # Reverse to get oldest first for RSI calculation
@@ -780,7 +794,7 @@ async def set_sub(app: Application, chat_id: int, interval_min: int, enabled: bo
         state.setdefault("subs", {})
         state["subs"][str(chat_id)] = {"interval_min": int(interval_min), "enabled": bool(enabled)}
         app.bot_data["state"] = state
-        save_state(state)
+        save_state(copy.deepcopy(state))
 
 
 async def delete_sub(app: Application, chat_id: int) -> None:
@@ -792,7 +806,7 @@ async def delete_sub(app: Application, chat_id: int) -> None:
         state = app.bot_data.get("state") or {"subs": {}, "alerts": {}}
         subs = state.setdefault("subs", {})
         subs.pop(str(chat_id), None)
-        save_state(state)
+        save_state(copy.deepcopy(state))
 
 
 async def get_alerts_for_chat(app: Application, chat_id: int) -> Dict[str, dict]:
@@ -838,7 +852,7 @@ async def set_alert_state(
             "last_above": last_above,  # can be None
         }
         app.bot_data["state"] = state
-        save_state(state)
+        save_state(copy.deepcopy(state))
 
 
 async def update_alert_last_above(app: Application, chat_id: int, symbol: str, tf: str, last_above: bool) -> None:
@@ -853,7 +867,7 @@ async def update_alert_last_above(app: Application, chat_id: int, symbol: str, t
         if key in alerts:
             alerts[key]["last_above"] = bool(last_above)
             app.bot_data["state"] = state
-            save_state(state)
+            save_state(copy.deepcopy(state))
 
 
 async def delete_alert_state(app: Application, chat_id: int, symbol: str, tf: str) -> None:
@@ -873,7 +887,7 @@ async def delete_alert_state(app: Application, chat_id: int, symbol: str, tf: st
         if key in alerts:
             alerts.pop(key, None)
             app.bot_data["state"] = state
-            save_state(state)
+            save_state(copy.deepcopy(state))
 
 
 # =========================
@@ -1247,8 +1261,20 @@ async def alert_job_callback(context: ContextTypes.DEFAULT_TYPE):
 
     except Exception as e:
         logging.exception("alert job failed for %s: %s", symbol, e)
-        # keep it quiet; optionally notify user:
-        # await app.bot.send_message(chat_id=chat_id, text=f"Alert error {symbol}({tf_label}): {e}")
+        notify_key = (chat_id, symbol, tf)
+        notify_cache = app.bot_data.setdefault("alert_error_notify", {})
+        now = time.time()
+        last_sent = notify_cache.get(notify_key, 0.0)
+        throttle_sec = ALERT_ERROR_THROTTLE_MIN * 60
+        if now - last_sent >= throttle_sec:
+            try:
+                await app.bot.send_message(
+                    chat_id=chat_id,
+                    text=f"Alert {symbol}({tf_label}) временно не проверяется из-за ошибки API.",
+                )
+                notify_cache[notify_key] = now
+            except Exception:
+                logging.error("Failed to send alert error message to chat %s", chat_id)
 
 
 # =========================
