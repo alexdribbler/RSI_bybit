@@ -4,6 +4,8 @@ import contextlib
 import json
 import logging
 import os
+import random
+from math import ceil
 import time
 from dataclasses import dataclass
 from datetime import datetime
@@ -94,7 +96,8 @@ RATE_LIMIT_MAX_DELAY = 60.0  # Maximum delay
 RATE_LIMIT_QUEUE_TIMEOUT = 300  # Maximum time to wait in queue (5 minutes)
 
 # Timeout for monitor scanning (seconds)
-MONITOR_TIMEOUT = 900  # 15 minutes (increased from 10)
+DEFAULT_MONITOR_TIMEOUT = max(180, int(ceil(MAX_SYMBOLS / max(1, MAX_CONCURRENCY) * 10)))
+MONITOR_TIMEOUT = int(os.getenv("MONITOR_TIMEOUT", str(DEFAULT_MONITOR_TIMEOUT)))
 
 # =========================
 # CONFIG VALIDATION
@@ -241,6 +244,7 @@ class RateLimiter:
         self._delay = RATE_LIMIT_DELAY
         self._last_request = 0.0
         self._rate_limited = False
+        self._success_streak = 0
     
     async def acquire(self):
         """Acquire permission to make a request with timeout."""
@@ -251,7 +255,8 @@ class RateLimiter:
                     if self._rate_limited:
                         wait_time = self._delay - (now - self._last_request)
                         if wait_time > 0:
-                            await asyncio.sleep(wait_time)
+                            jitter = random.uniform(0.7, 1.3)
+                            await asyncio.sleep(wait_time * jitter)
                     self._last_request = time.time()
         except asyncio.TimeoutError:
             raise BybitAPIError(f"Rate limiter queue timeout after {RATE_LIMIT_QUEUE_TIMEOUT}s")
@@ -261,16 +266,22 @@ class RateLimiter:
         async with self._lock:
             self._rate_limited = True
             self._delay = min(self._delay * 2, RATE_LIMIT_MAX_DELAY)
+            self._success_streak = 0
             logging.warning("Rate limit hit, increasing delay to %.2fs", self._delay)
     
     async def report_success(self):
         """Report a successful request."""
         async with self._lock:
             if self._rate_limited:
-                # Gradually decrease delay on success
-                self._delay = max(self._delay * 0.8, RATE_LIMIT_DELAY)
+                self._success_streak += 1
+                if self._success_streak >= 3:
+                    self._delay = max(self._delay * 0.5, RATE_LIMIT_DELAY)
+                else:
+                    # Gradually decrease delay on success
+                    self._delay = max(self._delay * 0.8, RATE_LIMIT_DELAY)
                 if self._delay <= RATE_LIMIT_DELAY:
                     self._rate_limited = False
+                    self._success_streak = 0
                     logging.info("Rate limiter reset")
 
 
