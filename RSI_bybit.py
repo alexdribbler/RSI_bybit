@@ -11,7 +11,7 @@ from typing import Dict, List, Optional, Tuple, Set
 from zoneinfo import ZoneInfo
 
 import aiohttp
-from dotenv import load_dotenv, find_dotenv
+from dotenv import load_dotenv
 from PIL import Image, ImageDraw, ImageFont
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
@@ -28,7 +28,8 @@ from telegram.ext import (
 # =========================
 # Load .env
 # =========================
-load_dotenv(find_dotenv())
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+load_dotenv(os.path.join(BASE_DIR, ".env"))
 
 # =========================
 # CONFIG
@@ -75,6 +76,8 @@ IMAGE_PADDING = int(os.getenv("IMAGE_PADDING", "26"))
 LINE_SPACING = int(os.getenv("LINE_SPACING", "6"))
 
 STATE_FILE = os.getenv("STATE_FILE", "bot_state.json")
+if not os.path.isabs(STATE_FILE):
+    STATE_FILE = os.path.join(BASE_DIR, STATE_FILE)
 
 # Subscription interval limits
 MIN_INTERVAL_MINUTES = 1
@@ -159,7 +162,7 @@ def validate_symbol(symbol: str, valid_symbols: Optional[Set[str]] = None) -> bo
         symbol: Symbol to validate
         valid_symbols: Optional whitelist of valid symbols from Bybit API
     """
-    if not isinstance(symbol, str) or len(symbol) > 20 or len(symbol) < 3:
+    if not isinstance(symbol, str) or len(symbol) > 30 or len(symbol) < 3:
         return False
     
     # Bybit format: only uppercase alphanumeric, must end with USDT
@@ -710,7 +713,7 @@ async def delete_sub(app: Application, chat_id: int) -> None:
     state_lock: asyncio.Lock = app.bot_data["state_lock"]
     async with state_lock:
         state = app.bot_data.get("state") or {"subs": {}, "alerts": {}}
-        subs = state.get("subs", {})
+        subs = state.setdefault("subs", {})
         subs.pop(str(chat_id), None)
         save_state(state)
 
@@ -1020,7 +1023,7 @@ async def run_monitor_once_internal(app: Application, chat_id: int):
     long_rows = long_candidates[:10]
     short_rows = short_candidates[:10]
 
-    await send_scan_result(app, chat_id, long_rows, short_rows, symbols_scanned=success_count)
+    await send_scan_result(app, chat_id, long_rows, short_rows, symbols_scanned=total_tasks)
 
 
 async def run_monitor_once(app: Application, chat_id: int):
@@ -1104,14 +1107,15 @@ async def alert_job_callback(context: ContextTypes.DEFAULT_TYPE):
 
         near = abs(rsi - threshold) <= ALERT_EPS
 
-        # First run: do not spam, but if near threshold - alert once.
+        # First run: do not spam, but alert if already met or near threshold.
         if prev is None:
             await update_alert_last_above(app, chat_id, symbol, tf, condition_met)
-            if near:
+            if condition_met or near:
+                extra = f"hit {trigger_label}" if condition_met else f"hit ≈ {threshold:.0f}"
                 await app.bot.send_message(
                     chat_id=chat_id,
                     text=(
-                        f"🔔 ALERT {symbol} {direction_label} RSI{RSI_PERIOD}({tf_label}) ≈ {threshold:.0f}\n"
+                        f"🔔 ALERT {symbol} {direction_label} RSI{RSI_PERIOD}({tf_label}) {extra}\n"
                         f"Current RSI: {rsi:.2f}"
                     ),
                 )
@@ -1283,7 +1287,6 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if data.startswith("SECTION|"):
-        await query.answer()
         return
 
     # Click on symbol from list
