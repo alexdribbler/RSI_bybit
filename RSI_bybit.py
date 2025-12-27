@@ -78,10 +78,12 @@ ALERT_EPS = float(os.getenv("ALERT_EPS", "0.10"))  # "equals threshold" toleranc
 ALERT_LONG_THRESHOLD = float(os.getenv("ALERT_LONG_THRESHOLD", "40"))
 ALERT_SHORT_THRESHOLD = float(os.getenv("ALERT_SHORT_THRESHOLD", "60"))
 ALERT_ERROR_THROTTLE_MIN = int(os.getenv("ALERT_ERROR_THROTTLE_MIN", "30"))
+ALERT_ERROR_NOTIFY_TTL_HOURS = float(os.getenv("ALERT_ERROR_NOTIFY_TTL_HOURS", "24"))
 MAX_ALERTS_PER_CHAT = int(os.getenv("MAX_ALERTS_PER_CHAT", "50"))
 MAX_ALERTS_GLOBAL = int(os.getenv("MAX_ALERTS_GLOBAL", "1000"))
 ALERT_TTL_HOURS = float(os.getenv("ALERT_TTL_HOURS", "24"))
 ALERT_COOLDOWN_SEC = int(os.getenv("ALERT_COOLDOWN_SEC", "0"))
+SHUTDOWN_TASK_TIMEOUT = int(os.getenv("SHUTDOWN_TASK_TIMEOUT", "10"))
 
 MAX_SYMBOLS = int(os.getenv("MAX_SYMBOLS", "200"))
 MAX_CONCURRENCY = int(os.getenv("MAX_CONCURRENCY", "20"))  # Increased from 10 for better performance
@@ -143,6 +145,10 @@ def validate_config() -> None:
         errors.append("ALERT_CHECK_SEC must be > 0")
     if ALERT_ERROR_THROTTLE_MIN <= 0:
         errors.append("ALERT_ERROR_THROTTLE_MIN must be > 0")
+    if ALERT_ERROR_NOTIFY_TTL_HOURS <= 0:
+        errors.append("ALERT_ERROR_NOTIFY_TTL_HOURS must be > 0")
+    if SHUTDOWN_TASK_TIMEOUT <= 0:
+        errors.append("SHUTDOWN_TASK_TIMEOUT must be > 0")
     if MAX_ALERTS_PER_CHAT <= 0:
         errors.append("MAX_ALERTS_PER_CHAT must be > 0")
     if MAX_ALERTS_GLOBAL <= 0:
@@ -420,6 +426,9 @@ async def api_get_json(
             ) as resp:
                 data = await resp.json(content_type=None)
 
+                if not isinstance(data, dict):
+                    raise BybitAPIError(f"Unexpected response payload type: {type(data).__name__}")
+
                 # Common rate limit code
                 if isinstance(data, dict) and data.get("retCode") == 10006:
                     await rate_limiter.report_rate_limit()
@@ -428,7 +437,7 @@ async def api_get_json(
                 if resp.status >= 400:
                     raise BybitAPIError(f"HTTP {resp.status}: {data}")
 
-                if isinstance(data, dict) and data.get("retCode") not in (0, None):
+                if data.get("retCode") not in (0, None):
                     raise BybitAPIError(f"Bybit retCode={data.get('retCode')} retMsg={data.get('retMsg')}")
 
                 # Report success to gradually reduce delays
@@ -1041,8 +1050,11 @@ async def set_alert_state(
         logging.warning("Invalid chat_id for alert: %s", chat_id)
         return False, "Некорректный chat_id."
 
-    if valid_symbols is None:
+    if valid_symbols is None or not valid_symbols:
         valid_symbols = await get_valid_symbols_with_fallback(app)
+    if not valid_symbols:
+        logging.warning("Valid symbols whitelist unavailable for alert state")
+        return False, "Whitelist временно недоступен. Попробуйте позже."
 
     if not validate_symbol(symbol, valid_symbols):
         logging.warning("Invalid symbol for alert: %s", symbol)
@@ -1088,6 +1100,8 @@ async def update_alert_last_above(app: Application, chat_id: int, symbol: str, t
         return
 
     valid_symbols = await get_valid_symbols_with_fallback(app)
+    if not valid_symbols:
+        return
     if not validate_symbol(symbol, valid_symbols):
         return
     
@@ -1113,6 +1127,8 @@ async def update_alert_created_at(app: Application, chat_id: int, symbol: str, t
         return
 
     valid_symbols = await get_valid_symbols_with_fallback(app)
+    if not valid_symbols:
+        return
     if not validate_symbol(symbol, valid_symbols):
         return
 
@@ -1142,6 +1158,8 @@ async def delete_alert_state(
 
     if validate_symbol_check:
         valid_symbols = await get_valid_symbols_with_fallback(app)
+        if not valid_symbols:
+            return
         if not validate_symbol(symbol, valid_symbols):
             return
 
@@ -1225,7 +1243,7 @@ def unschedule_subscription(app: Application, chat_id: int) -> None:
         j.schedule_removal()
 
 
-def schedule_alert(
+async def schedule_alert(
     app: Application,
     chat_id: int,
     symbol: str,
@@ -1237,12 +1255,13 @@ def schedule_alert(
     if not validate_chat_id(chat_id):
         logging.warning("Invalid chat_id for alert: %s", chat_id)
         return
-    
-    if valid_symbols is None:
-        perp_cache = app.bot_data.get("perp_symbols_cache")
-        if perp_cache:
-            valid_symbols = set(perp_cache.value)
-    
+
+    if valid_symbols is None or not valid_symbols:
+        valid_symbols = await get_valid_symbols_with_fallback(app)
+    if not valid_symbols:
+        logging.warning("Valid symbols whitelist unavailable for scheduling alert")
+        return
+
     if not validate_symbol(symbol, valid_symbols):
         logging.warning("Invalid symbol for alert: %s", symbol)
         return
@@ -1299,7 +1318,7 @@ async def restore_alerts(app: Application) -> None:
                 tf_label = a.get("tf_label") or f"{tf}m"
                 side = a.get("side")
                 if symbol and tf and side:
-                    schedule_alert(app, chat_id, symbol, tf, tf_label, side)
+                    await schedule_alert(app, chat_id, symbol, tf, tf_label, side)
             except Exception as e:
                 logging.warning("Failed restoring alert: %s", e)
 
@@ -1357,39 +1376,60 @@ async def run_monitor_once_internal(app: Application, chat_id: int):
     sem: asyncio.Semaphore = app.bot_data["http_sem"]
 
     results: List[Tuple[str, float, Dict[str, float]]] = []
-    tasks = {
-        asyncio.create_task(compute_symbol_rsi_sum(session, rate_limiter, sem, s)): s for s in symbols
-    }
+    queue: asyncio.Queue[str] = asyncio.Queue()
+    for symbol in symbols:
+        queue.put_nowait(symbol)
 
     # Track task statistics
-    total_tasks = len(tasks)
+    total_tasks = len(symbols)
     success_count = 0
     error_count = 0
 
-    try:
-        for task in asyncio.as_completed(tasks):
+    async def worker() -> Tuple[List[Tuple[str, float, Dict[str, float]]], int, int]:
+        local_results: List[Tuple[str, float, Dict[str, float]]] = []
+        local_success = 0
+        local_error = 0
+        while True:
             try:
-                r = await task
+                symbol = queue.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+            try:
+                r = await compute_symbol_rsi_sum(session, rate_limiter, sem, symbol)
                 if r is not None:
-                    results.append(r)
-                    success_count += 1
+                    local_results.append(r)
+                    local_success += 1
                 else:
-                    error_count += 1
+                    local_error += 1
             except asyncio.CancelledError:
                 logging.warning("Task cancelled during monitor scan")
-                error_count += 1
+                local_error += 1
                 raise
             except Exception as e:
-                symbol = tasks.get(task, "unknown")
                 logging.warning("Failed to compute RSI for %s: %s", symbol, e)
-                error_count += 1
-                continue
+                local_error += 1
+            finally:
+                queue.task_done()
+        return local_results, local_success, local_error
+
+    worker_count = min(MAX_CONCURRENCY, total_tasks) if total_tasks else 0
+    tasks = [asyncio.create_task(worker()) for _ in range(worker_count)]
+
+    try:
+        for local_results, local_success, local_error in await asyncio.gather(*tasks):
+            results.extend(local_results)
+            success_count += local_success
+            error_count += local_error
     finally:
         for task in tasks:
             task.cancel()
         if tasks:
-            with contextlib.suppress(asyncio.CancelledError):
-                await asyncio.shield(asyncio.gather(*tasks, return_exceptions=True))
+            gather_task = asyncio.gather(*tasks, return_exceptions=True)
+            try:
+                await asyncio.shield(gather_task)
+            except asyncio.CancelledError:
+                await gather_task
+                raise
 
     # Calculate error rate
     error_rate = error_count / total_tasks if total_tasks > 0 else 0
@@ -1495,6 +1535,9 @@ async def alert_job_callback(context: ContextTypes.DEFAULT_TYPE):
         sem: asyncio.Semaphore = app.bot_data["http_sem"]
         async with sem:
             valid_symbols = await get_valid_symbols_with_fallback(app)
+        if not valid_symbols:
+            logging.warning("Valid symbols whitelist unavailable for alert check")
+            return
         if not validate_symbol(symbol, valid_symbols):
             logging.warning("Invalid symbol for alert: %s", symbol)
             return
@@ -1555,6 +1598,11 @@ async def alert_job_callback(context: ContextTypes.DEFAULT_TYPE):
         notify_key = (chat_id, symbol, tf)
         notify_cache = app.bot_data.setdefault("alert_error_notify", {})
         now = time.time()
+        ttl_sec = ALERT_ERROR_NOTIFY_TTL_HOURS * 3600
+        if ttl_sec > 0 and notify_cache:
+            for key, last_seen in list(notify_cache.items()):
+                if now - last_seen >= ttl_sec:
+                    del notify_cache[key]
         last_sent = notify_cache.get(notify_key, 0.0)
         throttle_sec = ALERT_ERROR_THROTTLE_MIN * 60
         if now - last_sent >= throttle_sec:
@@ -1720,6 +1768,9 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             _, side, symbol = data.split("|", 2)
 
             valid_symbols = await get_valid_symbols_with_fallback(app)
+            if not valid_symbols:
+                await app.bot.send_message(chat_id=chat_id, text="Whitelist временно недоступен.")
+                return
 
             if not validate_symbol(symbol, valid_symbols):
                 await app.bot.send_message(chat_id=chat_id, text="Некорректный символ.")
@@ -1818,6 +1869,9 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 return
             
             valid_symbols = await get_valid_symbols_with_fallback(app)
+            if not valid_symbols:
+                await app.bot.send_message(chat_id=chat_id, text="Whitelist временно недоступен.")
+                return
 
             if not validate_symbol(symbol, valid_symbols):
                 await app.bot.send_message(chat_id=chat_id, text="Некорректный символ.")
@@ -1859,7 +1913,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if ALERT_COOLDOWN_SEC > 0:
             cooldowns = app.bot_data.setdefault("alert_cooldowns", {})
             cooldowns[chat_id] = time.time()
-        schedule_alert(app, chat_id, symbol, tf, tf_label, side, valid_symbols)
+        await schedule_alert(app, chat_id, symbol, tf, tf_label, side, valid_symbols)
 
         await app.bot.send_message(
             chat_id=chat_id,
@@ -1920,7 +1974,12 @@ async def post_shutdown(app: Application):
         if not task.done():
             task.cancel()
     if monitor_tasks:
-        await asyncio.gather(*monitor_tasks, return_exceptions=True)
+        gather_task = asyncio.gather(*monitor_tasks, return_exceptions=True)
+        try:
+            with contextlib.suppress(asyncio.CancelledError):
+                await asyncio.wait_for(gather_task, timeout=SHUTDOWN_TASK_TIMEOUT)
+        except asyncio.TimeoutError:
+            logging.warning("Monitor task shutdown timed out after %ss", SHUTDOWN_TASK_TIMEOUT)
 
     sess: aiohttp.ClientSession = app.bot_data.get("http_session")
     if sess:
