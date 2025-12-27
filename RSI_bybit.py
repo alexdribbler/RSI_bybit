@@ -43,6 +43,7 @@ BYBIT_BASE_URL = os.getenv("BYBIT_BASE_URL", "https://api.bybit.com").rstrip("/"
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 
 RSI_PERIOD = 6
+STOCH_RSI_PERIOD = int(os.getenv("STOCH_RSI_PERIOD", "14"))
 LEVERAGE = float(os.getenv("LEVERAGE", "20"))
 
 # RSI timeframes for SUM (now includes 5m)
@@ -62,6 +63,12 @@ ALERT_TFS: List[Tuple[str, str]] = [
     ("30m", "30"),
 ]
 ALERT_INTERVALS = {iv for _, iv in ALERT_TFS}
+
+STOCH_RSI_TFS: List[Tuple[str, str]] = [
+    ("5m", "5"),
+    ("15m", "15"),
+    ("30m", "30"),
+]
 
 ALERT_CHECK_SEC = int(os.getenv("ALERT_CHECK_SEC", "300"))  # check every 5 minutes by default
 ALERT_EPS = float(os.getenv("ALERT_EPS", "0.10"))  # "equals threshold" tolerance
@@ -149,6 +156,8 @@ def validate_config() -> None:
         errors.append("KLINE_LIMIT must be > 0")
     if RSI_PERIOD <= 0:
         errors.append("RSI_PERIOD must be > 0")
+    if STOCH_RSI_PERIOD <= 0:
+        errors.append("STOCH_RSI_PERIOD must be > 0")
     if RATE_LIMIT_DELAY <= 0:
         errors.append("RATE_LIMIT_DELAY must be > 0")
     if RATE_LIMIT_MAX_DELAY < RATE_LIMIT_DELAY:
@@ -571,6 +580,55 @@ def rsi_wilder(closes: List[float], period: int) -> Optional[float]:
     return 100.0 - (100.0 / (1.0 + rs))
 
 
+def rsi_wilder_series(closes: List[float], period: int) -> List[float]:
+    if not closes or len(closes) < period + 1:
+        return []
+
+    gains = []
+    losses = []
+    for i in range(1, len(closes)):
+        diff = closes[i] - closes[i - 1]
+        gains.append(diff if diff > 0 else 0.0)
+        losses.append(-diff if diff < 0 else 0.0)
+
+    avg_gain = sum(gains[:period]) / period
+    avg_loss = sum(losses[:period]) / period
+
+    rsi_values: List[float] = []
+    if avg_loss == 0:
+        rsi_values.append(100.0)
+    else:
+        rs = avg_gain / avg_loss
+        rsi_values.append(100.0 - (100.0 / (1.0 + rs)))
+
+    for i in range(period, len(gains)):
+        avg_gain = (avg_gain * (period - 1) + gains[i]) / period
+        avg_loss = (avg_loss * (period - 1) + losses[i]) / period
+        if avg_loss == 0:
+            rsi_values.append(100.0)
+        else:
+            rs = avg_gain / avg_loss
+            rsi_values.append(100.0 - (100.0 / (1.0 + rs)))
+
+    return rsi_values
+
+
+def stoch_rsi_from_closes(
+    closes: List[float],
+    rsi_period: int,
+    stoch_period: int,
+) -> Optional[float]:
+    rsi_values = rsi_wilder_series(closes, rsi_period)
+    if len(rsi_values) < stoch_period:
+        return None
+    window = rsi_values[-stoch_period:]
+    low = min(window)
+    high = max(window)
+    if high == low:
+        return 0.0
+    return (rsi_values[-1] - low) / (high - low) * 100.0
+
+
 def is_long_candidate(rsis: Dict[str, float]) -> bool:
     if any(val > 50 for val in rsis.values()):
         return False
@@ -643,6 +701,35 @@ async def get_last_hour_high_low(session: aiohttp.ClientSession, rate_limiter: R
     if hi is None or lo is None:
         raise BybitAPIError(f"Bad 1m kline rows for {symbol}")
     return hi, lo
+
+
+async def get_stoch_rsi_values(
+    session: aiohttp.ClientSession,
+    rate_limiter: RateLimiter,
+    symbol: str,
+) -> Dict[str, float]:
+    async def one_tf(tf_label: str, interval: str) -> Tuple[str, float]:
+        closes = await get_kline_closes(session, rate_limiter, symbol, interval, KLINE_LIMIT)
+        value = stoch_rsi_from_closes(closes, RSI_PERIOD, STOCH_RSI_PERIOD)
+        if value is None:
+            raise BybitAPIError(
+                f"Not enough data for Stoch RSI ({RSI_PERIOD},{STOCH_RSI_PERIOD}) {symbol} {tf_label}"
+            )
+        return tf_label, value
+
+    results = await asyncio.gather(*(one_tf(lbl, iv) for (lbl, iv) in STOCH_RSI_TFS))
+    return {label: value for label, value in results}
+
+
+def format_stoch_rsi_line(values: Dict[str, float]) -> str:
+    parts = []
+    for label, _ in STOCH_RSI_TFS:
+        value = values.get(label)
+        if value is None:
+            parts.append(f"{label} <code>n/a</code>")
+        else:
+            parts.append(f"{label} <code>{value:.2f}</code>")
+    return "Stoch RSI: " + " | ".join(parts)
 
 
 def levered_pct(delta: float, price: float, lev: float) -> float:
@@ -1598,6 +1685,12 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         try:
             price = await get_last_price(session, rate_limiter, symbol)
             hi, lo = await get_last_hour_high_low(session, rate_limiter, symbol)
+            try:
+                stoch_values = await get_stoch_rsi_values(session, rate_limiter, symbol)
+            except Exception as e:
+                logging.warning("Failed to compute Stoch RSI for %s: %s", symbol, e)
+                stoch_values = {}
+            stoch_line = format_stoch_rsi_line(stoch_values)
 
             if side == "L":
                 # LONG: risk is current to low, reward is current to high
@@ -1612,6 +1705,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     f"Current: <code>{price:.6f}</code>\n"
                     f"1h Low:  <code>{lo:.6f}</code>\n"
                     f"1h High: <code>{hi:.6f}</code>\n\n"
+                    f"{stoch_line}\n\n"
                     f"To 1h low ({LEVERAGE:.0f}x): <b>{dd:.2f}%</b>\n"
                     f"To 1h high ({LEVERAGE:.0f}x): <b>{up:.2f}%</b>\n"
                 )
@@ -1638,6 +1732,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     f"Current: <code>{price:.6f}</code>\n"
                     f"1h High: <code>{hi:.6f}</code>\n"
                     f"1h Low:  <code>{lo:.6f}</code>\n\n"
+                    f"{stoch_line}\n\n"
                     f"<b>If price rises to 1h high:</b> <b>-{loss_pct:.2f}%</b> (LOSS at {LEVERAGE:.0f}x)\n"
                     f"<b>If price falls to 1h low:</b> <b>+{profit_pct:.2f}%</b> (PROFIT at {LEVERAGE:.0f}x)\n"
                 )
