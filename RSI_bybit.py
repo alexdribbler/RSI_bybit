@@ -261,7 +261,7 @@ async def api_get_json(
                 if isinstance(data, dict) and data.get("retCode") not in (0, None):
                     raise BybitAPIError(f"Bybit retCode={data.get('retCode')} retMsg={data.get('retMsg')}")
 
-                # FIX: Report success to gradually reduce delays
+                # Report success to gradually reduce delays
                 await rate_limiter.report_success()
                 return data
 
@@ -674,9 +674,11 @@ def pairs_keyboard(long_syms: List[str], short_syms: List[str]) -> InlineKeyboar
 # BOT STATE HELPERS
 # =========================
 def get_sub(app: Application, chat_id: int) -> Optional[dict]:
+    """Get subscription for chat_id with thread-safe state access."""
     if not validate_chat_id(chat_id):
         return None
-    subs = (app.bot_data.get("state") or {}).get("subs", {})
+    state = app.bot_data.get("state") or {"subs": {}, "alerts": {}}
+    subs = state.get("subs", {})
     return subs.get(str(chat_id))
 
 
@@ -707,11 +709,12 @@ async def delete_sub(app: Application, chat_id: int) -> None:
 
 
 def get_alerts_for_chat(app: Application, chat_id: int) -> Dict[str, dict]:
+    """Get alerts for chat_id with thread-safe state access."""
     if not validate_chat_id(chat_id):
         return {}
     state = app.bot_data.get("state") or {"subs": {}, "alerts": {}}
-    alerts = state.setdefault("alerts", {})
-    return alerts.setdefault(str(chat_id), {})
+    alerts = state.get("alerts", {})
+    return alerts.get(str(chat_id), {})
 
 
 async def set_alert_state(
@@ -974,6 +977,10 @@ async def run_monitor_once_internal(app: Application, chat_id: int):
                 success_count += 1
             else:
                 error_count += 1
+        except asyncio.CancelledError:
+            logging.warning("Task cancelled during monitor scan")
+            error_count += 1
+            raise
         except Exception as e:
             logging.warning("Failed to compute RSI for a symbol: %s", e)
             error_count += 1
@@ -1301,10 +1308,13 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 # SHORT: entry at current price
                 # If price goes UP to 1h high → loss (risk)
                 # If price goes DOWN to 1h low → profit (reward)
-                risk_pct = levered_pct(hi - price, price, LEVERAGE)  # positive percentage (loss)
-                reward_pct = levered_pct(price - lo, price, LEVERAGE)  # positive percentage (profit)
-                risk = (hi - price)  # distance to stop loss
-                reward = (price - lo)  # distance to take profit
+                risk = (hi - price)  # distance to stop loss (upward movement)
+                reward = (price - lo)  # distance to take profit (downward movement)
+                
+                # Calculate percentages for display
+                loss_pct = abs(levered_pct(hi - price, price, LEVERAGE))  # show as positive number
+                profit_pct = abs(levered_pct(price - lo, price, LEVERAGE))  # show as positive number
+                
                 rr = safe_rr(reward, risk)
 
                 msg = (
@@ -1312,8 +1322,8 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     f"Current: <code>{price:.6f}</code>\n"
                     f"1h High: <code>{hi:.6f}</code>\n"
                     f"1h Low:  <code>{lo:.6f}</code>\n\n"
-                    f"<b>If price rises to 1h high:</b> <b>-{risk_pct:.2f}%</b> (LOSS at {LEVERAGE:.0f}x)\n"
-                    f"<b>If price falls to 1h low:</b> <b>+{reward_pct:.2f}%</b> (PROFIT at {LEVERAGE:.0f}x)\n"
+                    f"<b>If price rises to 1h high:</b> <b>-{loss_pct:.2f}%</b> (LOSS at {LEVERAGE:.0f}x)\n"
+                    f"<b>If price falls to 1h low:</b> <b>+{profit_pct:.2f}%</b> (PROFIT at {LEVERAGE:.0f}x)\n"
                 )
                 if rr is None:
                     msg += "Risk/Reward: <b>∞</b>\n"
