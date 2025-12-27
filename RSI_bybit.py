@@ -7,7 +7,7 @@ import time
 from dataclasses import dataclass
 from datetime import datetime
 from io import BytesIO
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Set
 from zoneinfo import ZoneInfo
 
 import aiohttp
@@ -79,6 +79,13 @@ STATE_FILE = os.getenv("STATE_FILE", "bot_state.json")
 MIN_INTERVAL_MINUTES = 1
 MAX_INTERVAL_MINUTES = 1440
 
+# Error rate threshold for notifications (percentage)
+ERROR_RATE_THRESHOLD = 0.3  # 30%
+
+# Global rate limiter settings
+RATE_LIMIT_DELAY = 1.0  # Initial delay in seconds
+RATE_LIMIT_MAX_DELAY = 60.0  # Maximum delay
+
 # =========================
 # LOGGING
 # =========================
@@ -134,9 +141,25 @@ def validate_chat_id(chat_id: int) -> bool:
     return isinstance(chat_id, int) and abs(chat_id) < 10**15
 
 
-def validate_symbol(symbol: str) -> bool:
-    """Validate symbol to prevent injection attacks."""
-    return isinstance(symbol, str) and symbol.isalnum() and len(symbol) <= 20
+def validate_symbol(symbol: str, valid_symbols: Optional[Set[str]] = None) -> bool:
+    """Validate symbol to prevent injection attacks.
+    
+    Args:
+        symbol: Symbol to validate
+        valid_symbols: Optional whitelist of valid symbols from Bybit API
+    """
+    if not isinstance(symbol, str) or len(symbol) > 20:
+        return False
+    
+    # Basic validation: alphanumeric plus allowed special chars
+    if not all(c.isalnum() or c in "-_" for c in symbol):
+        return False
+    
+    # If whitelist provided, check against it
+    if valid_symbols is not None:
+        return symbol in valid_symbols
+    
+    return True
 
 
 def validate_interval(interval_min: int) -> bool:
@@ -157,10 +180,48 @@ class BybitAPIError(Exception):
     pass
 
 
+class RateLimiter:
+    """Global rate limiter with dynamic backoff."""
+    
+    def __init__(self):
+        self._lock = asyncio.Lock()
+        self._delay = RATE_LIMIT_DELAY
+        self._last_request = 0.0
+        self._rate_limited = False
+    
+    async def acquire(self):
+        """Acquire permission to make a request."""
+        async with self._lock:
+            now = time.time()
+            if self._rate_limited:
+                wait_time = self._delay - (now - self._last_request)
+                if wait_time > 0:
+                    await asyncio.sleep(wait_time)
+            self._last_request = time.time()
+    
+    async def report_rate_limit(self):
+        """Report that a rate limit was hit."""
+        async with self._lock:
+            self._rate_limited = True
+            self._delay = min(self._delay * 2, RATE_LIMIT_MAX_DELAY)
+            logging.warning("Rate limit hit, increasing delay to %.2fs", self._delay)
+    
+    async def report_success(self):
+        """Report a successful request."""
+        async with self._lock:
+            if self._rate_limited:
+                # Gradually decrease delay on success
+                self._delay = max(self._delay * 0.8, RATE_LIMIT_DELAY)
+                if self._delay <= RATE_LIMIT_DELAY:
+                    self._rate_limited = False
+                    logging.info("Rate limiter reset")
+
+
 async def api_get_json(
     session: aiohttp.ClientSession,
     url: str,
     params: Dict[str, str],
+    rate_limiter: RateLimiter,
     retries: int = 5,
 ) -> dict:
     backoff = 0.8
@@ -168,6 +229,8 @@ async def api_get_json(
 
     for attempt in range(retries):
         try:
+            await rate_limiter.acquire()
+            
             async with session.get(
                 url,
                 params=params,
@@ -177,6 +240,7 @@ async def api_get_json(
 
                 # Common rate limit code
                 if isinstance(data, dict) and data.get("retCode") == 10006:
+                    await rate_limiter.report_rate_limit()
                     raise BybitAPIError("Bybit rate limit: retCode=10006 (Too many visits!)")
 
                 if resp.status >= 400:
@@ -185,6 +249,7 @@ async def api_get_json(
                 if isinstance(data, dict) and data.get("retCode") not in (0, None):
                     raise BybitAPIError(f"Bybit retCode={data.get('retCode')} retMsg={data.get('retMsg')}")
 
+                await rate_limiter.report_success()
                 return data
 
         except (asyncio.TimeoutError, aiohttp.ClientError, BybitAPIError) as e:
@@ -200,7 +265,7 @@ async def api_get_json(
 # =========================
 # BYBIT DATA: Perpetual symbols only
 # =========================
-async def get_all_usdt_linear_perp_symbols(session: aiohttp.ClientSession) -> List[str]:
+async def get_all_usdt_linear_perp_symbols(session: aiohttp.ClientSession, rate_limiter: RateLimiter) -> List[str]:
     """
     Only LinearPerpetual (USDT-settled), status Trading, quoteCoin USDT.
     """
@@ -213,7 +278,7 @@ async def get_all_usdt_linear_perp_symbols(session: aiohttp.ClientSession) -> Li
         if cursor:
             params["cursor"] = cursor
 
-        payload = await api_get_json(session, url, params)
+        payload = await api_get_json(session, url, params, rate_limiter)
         result = payload.get("result") or {}
         items = result.get("list") or []
 
@@ -242,21 +307,22 @@ async def get_all_usdt_linear_perp_symbols(session: aiohttp.ClientSession) -> Li
     return sorted(set(out))
 
 
-async def get_linear_tickers(session: aiohttp.ClientSession, symbol: Optional[str] = None) -> List[dict]:
+async def get_linear_tickers(session: aiohttp.ClientSession, rate_limiter: RateLimiter, symbol: Optional[str] = None) -> List[dict]:
     url = f"{BYBIT_BASE_URL}/v5/market/tickers"
     params = {"category": "linear"}
     if symbol:
         params["symbol"] = symbol
-    payload = await api_get_json(session, url, params)
+    payload = await api_get_json(session, url, params, rate_limiter)
     return (payload.get("result") or {}).get("list") or []
 
 
 async def pick_top_symbols_by_turnover(
     session: aiohttp.ClientSession,
+    rate_limiter: RateLimiter,
     perp_symbols_set: set,
     limit: int,
 ) -> List[str]:
-    tickers = await get_linear_tickers(session)
+    tickers = await get_linear_tickers(session, rate_limiter)
     rows: List[Tuple[str, float]] = []
 
     for it in tickers:
@@ -278,6 +344,7 @@ async def pick_top_symbols_by_turnover(
 # =========================
 async def get_kline_rows(
     session: aiohttp.ClientSession,
+    rate_limiter: RateLimiter,
     symbol: str,
     interval: str,
     limit: int,
@@ -289,14 +356,14 @@ async def get_kline_rows(
         "interval": interval,
         "limit": str(limit),
     }
-    payload = await api_get_json(session, url, params)
+    payload = await api_get_json(session, url, params, rate_limiter)
     rows = ((payload.get("result") or {}).get("list")) or []
     # API returns newest first
     return rows
 
 
-async def get_kline_closes(session: aiohttp.ClientSession, symbol: str, interval: str, limit: int) -> List[float]:
-    rows = await get_kline_rows(session, symbol, interval, limit)
+async def get_kline_closes(session: aiohttp.ClientSession, rate_limiter: RateLimiter, symbol: str, interval: str, limit: int) -> List[float]:
+    rows = await get_kline_rows(session, rate_limiter, symbol, interval, limit)
     closes: List[float] = []
     for c in rows:
         # [startTime, open, high, low, close, volume, turnover]
@@ -349,6 +416,7 @@ def is_short_candidate(rsis: Dict[str, float]) -> bool:
 
 async def compute_symbol_rsi_sum(
     session: aiohttp.ClientSession,
+    rate_limiter: RateLimiter,
     sem: asyncio.Semaphore,
     symbol: str,
 ) -> Optional[Tuple[str, float, Dict[str, float]]]:
@@ -356,7 +424,7 @@ async def compute_symbol_rsi_sum(
 
     async def one_tf(tf_label: str, interval: str):
         async with sem:
-            closes = await get_kline_closes(session, symbol, interval, KLINE_LIMIT)
+            closes = await get_kline_closes(session, rate_limiter, symbol, interval, KLINE_LIMIT)
         val = rsi_wilder(closes, RSI_PERIOD)
         if val is None:
             raise BybitAPIError(f"Not enough data for RSI{RSI_PERIOD} {symbol} {tf_label}")
@@ -375,8 +443,8 @@ async def compute_symbol_rsi_sum(
 # =========================
 # EXTRA: symbol click calc (1h high/low + RR)
 # =========================
-async def get_last_price(session: aiohttp.ClientSession, symbol: str) -> float:
-    items = await get_linear_tickers(session, symbol=symbol)
+async def get_last_price(session: aiohttp.ClientSession, rate_limiter: RateLimiter, symbol: str) -> float:
+    items = await get_linear_tickers(session, rate_limiter, symbol=symbol)
     if not items:
         raise BybitAPIError(f"Ticker empty for {symbol}")
     it = items[0]
@@ -386,9 +454,9 @@ async def get_last_price(session: aiohttp.ClientSession, symbol: str) -> float:
         raise BybitAPIError(f"Bad lastPrice for {symbol}: {it.get('lastPrice')}")
 
 
-async def get_last_hour_high_low(session: aiohttp.ClientSession, symbol: str) -> Tuple[float, float]:
+async def get_last_hour_high_low(session: aiohttp.ClientSession, rate_limiter: RateLimiter, symbol: str) -> Tuple[float, float]:
     # 1m candles, last 60 minutes
-    rows = await get_kline_rows(session, symbol, interval="1", limit=60)
+    rows = await get_kline_rows(session, rate_limiter, symbol, interval="1", limit=60)
     if not rows:
         raise BybitAPIError(f"No 1m kline for {symbol}")
     hi = None
@@ -578,25 +646,30 @@ def get_sub(app: Application, chat_id: int) -> Optional[dict]:
     return subs.get(str(chat_id))
 
 
-def set_sub(app: Application, chat_id: int, interval_min: int, enabled: bool = True) -> None:
+async def set_sub(app: Application, chat_id: int, interval_min: int, enabled: bool = True) -> None:
     if not validate_chat_id(chat_id) or not validate_interval(interval_min):
         logging.warning("Invalid chat_id or interval: %s, %s", chat_id, interval_min)
         return
     
-    state = app.bot_data.get("state") or {"subs": {}, "alerts": {}}
-    state.setdefault("subs", {})
-    state["subs"][str(chat_id)] = {"interval_min": int(interval_min), "enabled": bool(enabled)}
-    app.bot_data["state"] = state
-    save_state(state)
+    state_lock: asyncio.Lock = app.bot_data["state_lock"]
+    async with state_lock:
+        state = app.bot_data.get("state") or {"subs": {}, "alerts": {}}
+        state.setdefault("subs", {})
+        state["subs"][str(chat_id)] = {"interval_min": int(interval_min), "enabled": bool(enabled)}
+        app.bot_data["state"] = state
+        save_state(state)
 
 
-def delete_sub(app: Application, chat_id: int) -> None:
+async def delete_sub(app: Application, chat_id: int) -> None:
     if not validate_chat_id(chat_id):
         return
-    state = app.bot_data.get("state") or {"subs": {}, "alerts": {}}
-    subs = state.get("subs", {})
-    subs.pop(str(chat_id), None)
-    save_state(state)
+    
+    state_lock: asyncio.Lock = app.bot_data["state_lock"]
+    async with state_lock:
+        state = app.bot_data.get("state") or {"subs": {}, "alerts": {}}
+        subs = state.get("subs", {})
+        subs.pop(str(chat_id), None)
+        save_state(state)
 
 
 def get_alerts_for_chat(app: Application, chat_id: int) -> Dict[str, dict]:
@@ -607,7 +680,7 @@ def get_alerts_for_chat(app: Application, chat_id: int) -> Dict[str, dict]:
     return alerts.setdefault(str(chat_id), {})
 
 
-def set_alert_state(
+async def set_alert_state(
     app: Application,
     chat_id: int,
     symbol: str,
@@ -615,33 +688,48 @@ def set_alert_state(
     tf_label: str,
     last_above: Optional[bool] = None,
 ) -> None:
-    if not validate_chat_id(chat_id) or not validate_symbol(symbol):
-        logging.warning("Invalid chat_id or symbol for alert: %s, %s", chat_id, symbol)
+    if not validate_chat_id(chat_id):
+        logging.warning("Invalid chat_id for alert: %s", chat_id)
         return
     
-    state = app.bot_data.get("state") or {"subs": {}, "alerts": {}}
-    alerts = state.setdefault("alerts", {}).setdefault(str(chat_id), {})
-    key = f"{symbol}|{tf}"
-    alerts[key] = {
-        "symbol": symbol,
-        "tf": tf,
-        "tf_label": tf_label,
-        "last_above": last_above,  # can be None
-    }
-    app.bot_data["state"] = state
-    save_state(state)
-
-
-def update_alert_last_above(app: Application, chat_id: int, symbol: str, tf: str, last_above: bool) -> None:
-    if not validate_chat_id(chat_id):
+    # Get valid symbols for validation
+    valid_symbols = None
+    perp_cache = app.bot_data.get("perp_symbols_cache")
+    if perp_cache:
+        valid_symbols = set(perp_cache.value)
+    
+    if not validate_symbol(symbol, valid_symbols):
+        logging.warning("Invalid symbol for alert: %s", symbol)
         return
-    state = app.bot_data.get("state") or {"subs": {}, "alerts": {}}
-    alerts = state.setdefault("alerts", {}).setdefault(str(chat_id), {})
-    key = f"{symbol}|{tf}"
-    if key in alerts:
-        alerts[key]["last_above"] = bool(last_above)
+    
+    state_lock: asyncio.Lock = app.bot_data["state_lock"]
+    async with state_lock:
+        state = app.bot_data.get("state") or {"subs": {}, "alerts": {}}
+        alerts = state.setdefault("alerts", {}).setdefault(str(chat_id), {})
+        key = f"{symbol}|{tf}"
+        alerts[key] = {
+            "symbol": symbol,
+            "tf": tf,
+            "tf_label": tf_label,
+            "last_above": last_above,  # can be None
+        }
         app.bot_data["state"] = state
         save_state(state)
+
+
+async def update_alert_last_above(app: Application, chat_id: int, symbol: str, tf: str, last_above: bool) -> None:
+    if not validate_chat_id(chat_id):
+        return
+    
+    state_lock: asyncio.Lock = app.bot_data["state_lock"]
+    async with state_lock:
+        state = app.bot_data.get("state") or {"subs": {}, "alerts": {}}
+        alerts = state.setdefault("alerts", {}).setdefault(str(chat_id), {})
+        key = f"{symbol}|{tf}"
+        if key in alerts:
+            alerts[key]["last_above"] = bool(last_above)
+            app.bot_data["state"] = state
+            save_state(state)
 
 
 # =========================
@@ -654,7 +742,8 @@ async def get_cached_perp_symbols(app: Application) -> List[str]:
         return cached.value  # type: ignore
 
     session: aiohttp.ClientSession = app.bot_data["http_session"]
-    symbols = await get_all_usdt_linear_perp_symbols(session)
+    rate_limiter: RateLimiter = app.bot_data["rate_limiter"]
+    symbols = await get_all_usdt_linear_perp_symbols(session, rate_limiter)
     app.bot_data["perp_symbols_cache"] = CacheItem(ts=now, value=symbols)
     return symbols
 
@@ -666,8 +755,9 @@ async def get_cached_top_symbols(app: Application) -> List[str]:
         return cached.value  # type: ignore
 
     session: aiohttp.ClientSession = app.bot_data["http_session"]
+    rate_limiter: RateLimiter = app.bot_data["rate_limiter"]
     perp_symbols = await get_cached_perp_symbols(app)
-    top = await pick_top_symbols_by_turnover(session, set(perp_symbols), MAX_SYMBOLS)
+    top = await pick_top_symbols_by_turnover(session, rate_limiter, set(perp_symbols), MAX_SYMBOLS)
     app.bot_data["tickers_cache"] = CacheItem(ts=now, value=top)
     return top
 
@@ -699,8 +789,18 @@ def unschedule_subscription(app: Application, chat_id: int) -> None:
 
 
 def schedule_alert(app: Application, chat_id: int, symbol: str, tf: str, tf_label: str) -> None:
-    if not validate_chat_id(chat_id) or not validate_symbol(symbol):
-        logging.warning("Invalid parameters for alert: chat_id=%s, symbol=%s", chat_id, symbol)
+    if not validate_chat_id(chat_id):
+        logging.warning("Invalid chat_id for alert: %s", chat_id)
+        return
+    
+    # Get valid symbols for validation
+    valid_symbols = None
+    perp_cache = app.bot_data.get("perp_symbols_cache")
+    if perp_cache:
+        valid_symbols = set(perp_cache.value)
+    
+    if not validate_symbol(symbol, valid_symbols):
+        logging.warning("Invalid symbol for alert: %s", symbol)
         return
     
     # dedupe by job name
@@ -736,7 +836,7 @@ def restore_alerts(app: Application) -> None:
                 symbol = a.get("symbol")
                 tf = a.get("tf")
                 tf_label = a.get("tf_label") or f"{tf}m"
-                if symbol and tf and validate_symbol(symbol):
+                if symbol and tf:
                     schedule_alert(app, chat_id, symbol, tf, tf_label)
             except Exception as e:
                 logging.warning("Failed restoring alert: %s", e)
@@ -774,21 +874,41 @@ async def send_scan_result(app: Application, chat_id: int, long_rows, short_rows
 
 async def run_monitor_once(app: Application, chat_id: int):
     session: aiohttp.ClientSession = app.bot_data["http_session"]
+    rate_limiter: RateLimiter = app.bot_data["rate_limiter"]
     symbols = await get_cached_top_symbols(app)
     sem = asyncio.Semaphore(MAX_CONCURRENCY)
 
     results: List[Tuple[str, float, Dict[str, float]]] = []
-    tasks = [compute_symbol_rsi_sum(session, sem, s) for s in symbols]
+    tasks = [compute_symbol_rsi_sum(session, rate_limiter, sem, s) for s in symbols]
 
-    # Improved error handling for async tasks
+    # Track task statistics
+    total_tasks = len(tasks)
+    success_count = 0
+    error_count = 0
+
     for coro in asyncio.as_completed(tasks):
         try:
             r = await coro
             if r is not None:
                 results.append(r)
+                success_count += 1
+            else:
+                error_count += 1
         except Exception as e:
             logging.warning("Failed to compute RSI for a symbol: %s", e)
+            error_count += 1
             continue
+
+    # Calculate error rate
+    error_rate = error_count / total_tasks if total_tasks > 0 else 0
+    
+    # Notify user if error rate is high
+    if error_rate > ERROR_RATE_THRESHOLD:
+        await app.bot.send_message(
+            chat_id=chat_id,
+            text=f"⚠️ Внимание: {error_count}/{total_tasks} символов не удалось обработать ({error_rate*100:.1f}% ошибок). "
+                 f"Возможны проблемы с API или rate limiting."
+        )
 
     if not results:
         await app.bot.send_message(chat_id=chat_id, text="Не получилось собрать RSI (rate limit/временная ошибка).")
@@ -803,7 +923,7 @@ async def run_monitor_once(app: Application, chat_id: int):
     long_rows = long_candidates[:10]
     short_rows = short_candidates[:10]
 
-    await send_scan_result(app, chat_id, long_rows, short_rows, symbols_scanned=len(results))
+    await send_scan_result(app, chat_id, long_rows, short_rows, symbols_scanned=success_count)
 
 
 # =========================
@@ -831,15 +951,26 @@ async def alert_job_callback(context: ContextTypes.DEFAULT_TYPE):
     if not symbol or not tf:
         return
     
-    if not validate_chat_id(chat_id) or not validate_symbol(symbol):
-        logging.warning("Invalid alert parameters: chat_id=%s, symbol=%s", chat_id, symbol)
+    if not validate_chat_id(chat_id):
+        logging.warning("Invalid chat_id for alert: %s", chat_id)
+        return
+    
+    # Validate symbol with whitelist
+    app = context.application
+    valid_symbols = None
+    perp_cache = app.bot_data.get("perp_symbols_cache")
+    if perp_cache:
+        valid_symbols = set(perp_cache.value)
+    
+    if not validate_symbol(symbol, valid_symbols):
+        logging.warning("Invalid symbol for alert: %s", symbol)
         return
 
-    app = context.application
     session: aiohttp.ClientSession = app.bot_data["http_session"]
+    rate_limiter: RateLimiter = app.bot_data["rate_limiter"]
 
     try:
-        closes = await get_kline_closes(session, symbol, tf, KLINE_LIMIT)
+        closes = await get_kline_closes(session, rate_limiter, symbol, tf, KLINE_LIMIT)
         rsi = rsi_wilder(closes, RSI_PERIOD)
         if rsi is None:
             return
@@ -853,7 +984,7 @@ async def alert_job_callback(context: ContextTypes.DEFAULT_TYPE):
 
         # First run: do not spam, but if "near 50" - alert once.
         if prev is None:
-            update_alert_last_above(app, chat_id, symbol, tf, now_above)
+            await update_alert_last_above(app, chat_id, symbol, tf, now_above)
             if near:
                 await app.bot.send_message(
                     chat_id=chat_id,
@@ -871,7 +1002,7 @@ async def alert_job_callback(context: ContextTypes.DEFAULT_TYPE):
                 text=f"🔔 ALERT {symbol} RSI{RSI_PERIOD}({tf_label}) {extra}\nCurrent RSI: {rsi:.2f}",
             )
 
-        update_alert_last_above(app, chat_id, symbol, tf, now_above)
+        await update_alert_last_above(app, chat_id, symbol, tf, now_above)
 
     except Exception as e:
         logging.exception("alert job failed for %s: %s", symbol, e)
@@ -934,7 +1065,7 @@ async def apply_interval(app: Application, chat_id: int, minutes: int):
         )
         return
 
-    set_sub(app, chat_id, minutes, enabled=True)
+    await set_sub(app, chat_id, minutes, enabled=True)
     schedule_subscription(app, chat_id, minutes)
 
     await app.bot.send_message(chat_id=chat_id, text=f"✅ Подписка создана/обновлена: каждые {minutes} минут.")
@@ -954,6 +1085,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = query.message.chat_id
     app = context.application
     session: aiohttp.ClientSession = app.bot_data["http_session"]
+    rate_limiter: RateLimiter = app.bot_data["rate_limiter"]
 
     data = query.data or ""
     sub = get_sub(app, chat_id)
@@ -1006,7 +1138,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data == "SUB_DELETE":
         context.user_data["await_interval"] = False
         unschedule_subscription(app, chat_id)
-        delete_sub(app, chat_id)
+        await delete_sub(app, chat_id)
         await query.edit_message_text("🗑 Подписка удалена.", reply_markup=main_menu_kb(False))
         return
 
@@ -1029,7 +1161,14 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # format: PAIR|L|BTCUSDT  or PAIR|S|BTCUSDT
         try:
             _, side, symbol = data.split("|", 2)
-            if not validate_symbol(symbol):
+            
+            # Get valid symbols for validation
+            valid_symbols = None
+            perp_cache = app.bot_data.get("perp_symbols_cache")
+            if perp_cache:
+                valid_symbols = set(perp_cache.value)
+            
+            if not validate_symbol(symbol, valid_symbols):
                 await app.bot.send_message(chat_id=chat_id, text="Некорректный символ.")
                 return
         except Exception:
@@ -1038,8 +1177,8 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await app.bot.send_message(chat_id=chat_id, text=f"Считаю {symbol} (last 1h)…")
 
         try:
-            price = await get_last_price(session, symbol)
-            hi, lo = await get_last_hour_high_low(session, symbol)
+            price = await get_last_price(session, rate_limiter, symbol)
+            hi, lo = await get_last_hour_high_low(session, rate_limiter, symbol)
 
             if side == "L":
                 dd = levered_pct(lo - price, price, LEVERAGE)     # negative
@@ -1100,7 +1239,14 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # format: ALERT|15|BTCUSDT
         try:
             _, tf, symbol = data.split("|", 2)
-            if not validate_symbol(symbol):
+            
+            # Get valid symbols for validation
+            valid_symbols = None
+            perp_cache = app.bot_data.get("perp_symbols_cache")
+            if perp_cache:
+                valid_symbols = set(perp_cache.value)
+            
+            if not validate_symbol(symbol, valid_symbols):
                 await app.bot.send_message(chat_id=chat_id, text="Некорректный символ.")
                 return
         except Exception:
@@ -1109,7 +1255,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         tf_label = next((lbl for (lbl, iv) in ALERT_TFS if iv == tf), f"{tf}m")
 
         # Save alert with last_above = None (first check will set)
-        set_alert_state(app, chat_id, symbol, tf, tf_label, last_above=None)
+        await set_alert_state(app, chat_id, symbol, tf, tf_label, last_above=None)
         schedule_alert(app, chat_id, symbol, tf, tf_label)
 
         await app.bot.send_message(
@@ -1127,6 +1273,8 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # =========================
 async def post_init(app: Application):
     app.bot_data["http_session"] = aiohttp.ClientSession()
+    app.bot_data["rate_limiter"] = RateLimiter()
+    app.bot_data["state_lock"] = asyncio.Lock()
     app.bot_data["state"] = load_state()
     app.bot_data["perp_symbols_cache"] = None
     app.bot_data["tickers_cache"] = None
