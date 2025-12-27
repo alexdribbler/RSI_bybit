@@ -55,6 +55,7 @@ TIMEFRAME_REGISTRY: Dict[str, str] = {
     "2h": "120",
     "4h": "240",
 }
+TIMEFRAME_BY_INTERVAL = {interval: label for label, interval in TIMEFRAME_REGISTRY.items()}
 
 # RSI timeframes for SUM (now includes 5m)
 TIMEFRAMES: List[Tuple[str, str]] = [(label, interval) for label, interval in TIMEFRAME_REGISTRY.items()]
@@ -67,11 +68,10 @@ ALERT_TFS: List[Tuple[str, str]] = [
 ]
 ALERT_INTERVALS = {iv for _, iv in ALERT_TFS}
 
-STOCH_RSI_TFS: List[Tuple[str, str]] = [
-    (label, interval)
-    for label, interval in TIMEFRAME_REGISTRY.items()
-    if label in {"5m", "15m", "30m"}
-]
+STOCH_RSI_TFS: List[Tuple[str, str]] = list(TIMEFRAMES)
+
+PAIR_RSI_LOW_THRESHOLD = float(os.getenv("PAIR_RSI_LOW_THRESHOLD", "15"))
+PAIR_RSI_HIGH_THRESHOLD = float(os.getenv("PAIR_RSI_HIGH_THRESHOLD", "90"))
 
 ALERT_CHECK_SEC = int(os.getenv("ALERT_CHECK_SEC", "300"))  # check every 5 minutes by default
 ALERT_EPS = float(os.getenv("ALERT_EPS", "0.10"))  # "equals threshold" tolerance
@@ -167,6 +167,8 @@ def validate_config() -> None:
         errors.append("RSI_PERIOD must be > 0")
     if STOCH_RSI_PERIOD <= 0:
         errors.append("STOCH_RSI_PERIOD must be > 0")
+    if not (0 <= PAIR_RSI_LOW_THRESHOLD < PAIR_RSI_HIGH_THRESHOLD <= 100):
+        errors.append("PAIR_RSI thresholds must be 0 <= low < high <= 100")
     if RATE_LIMIT_DELAY <= 0:
         errors.append("RATE_LIMIT_DELAY must be > 0")
     if RATE_LIMIT_MAX_DELAY < RATE_LIMIT_DELAY:
@@ -220,7 +222,7 @@ def load_state() -> dict:
             logging.warning("Invalid state file moved to %s", bad_name)
     except Exception as e:
         logging.warning("Failed to load state: %s", e)
-    return {"subs": {}, "alerts": {}}
+    return {"subs": {}, "alerts": {}, "pair_rsi_alerts": {}}
 
 
 def save_state_json(state_json: str) -> None:
@@ -255,7 +257,8 @@ def validate_state(state: object) -> bool:
         return False
     subs = state.get("subs", {})
     alerts = state.get("alerts", {})
-    if not isinstance(subs, dict) or not isinstance(alerts, dict):
+    pair_alerts = state.get("pair_rsi_alerts", {})
+    if not isinstance(subs, dict) or not isinstance(alerts, dict) or not isinstance(pair_alerts, dict):
         return False
     for chat_id, sub in subs.items():
         if not isinstance(chat_id, str) or not isinstance(sub, dict):
@@ -278,6 +281,18 @@ def validate_state(state: object) -> bool:
             last_above = alert.get("last_above")
             if last_above is not None and not isinstance(last_above, bool):
                 return False
+    for chat_id, amap in pair_alerts.items():
+        if not isinstance(chat_id, str) or not isinstance(amap, dict):
+            return False
+        for _, alert in amap.items():
+            if not isinstance(alert, dict):
+                return False
+            if not isinstance(alert.get("symbol"), str):
+                return False
+            if not isinstance(alert.get("tfs"), list):
+                return False
+            if alert.get("mode") not in {"LOW", "HIGH"}:
+                return False
     return True
 
 
@@ -287,6 +302,10 @@ def get_sub_job_name(chat_id: int) -> str:
 
 def get_alert_job_name(chat_id: int, symbol: str, tf: str) -> str:
     return f"rsi_alert:{chat_id}:{symbol}:{tf}"
+
+
+def get_pair_rsi_alert_job_name(chat_id: int) -> str:
+    return f"pair_rsi_alert:{chat_id}"
 
 
 # =========================
@@ -340,6 +359,18 @@ def validate_symbol(symbol: str, valid_symbols: Optional[Set[str]] = None) -> bo
 def validate_interval(interval_min: int) -> bool:
     """Validate subscription interval."""
     return MIN_INTERVAL_MINUTES <= interval_min <= MAX_INTERVAL_MINUTES
+
+
+def normalize_symbol(raw: str) -> Optional[str]:
+    """Normalize user-entered symbol into Bybit linear USDT format."""
+    if not isinstance(raw, str):
+        return None
+    cleaned = "".join(ch for ch in raw.strip().upper() if ch.isalnum())
+    if not cleaned or len(cleaned) > 30:
+        return None
+    if not cleaned.endswith("USDT"):
+        return None
+    return cleaned
 
 
 # =========================
@@ -728,9 +759,14 @@ async def get_stoch_rsi_values(
     session: aiohttp.ClientSession,
     rate_limiter: RateLimiter,
     symbol: str,
+    sem: Optional[asyncio.Semaphore] = None,
 ) -> Dict[str, float]:
     async def one_tf(tf_label: str, interval: str) -> Tuple[str, float]:
-        closes = await get_kline_closes(session, rate_limiter, symbol, interval, KLINE_LIMIT)
+        if sem is None:
+            closes = await get_kline_closes(session, rate_limiter, symbol, interval, KLINE_LIMIT)
+        else:
+            async with sem:
+                closes = await get_kline_closes(session, rate_limiter, symbol, interval, KLINE_LIMIT)
         value = stoch_rsi_from_closes(closes, RSI_PERIOD, STOCH_RSI_PERIOD)
         if value is None:
             raise BybitAPIError(
@@ -740,6 +776,46 @@ async def get_stoch_rsi_values(
 
     results = await asyncio.gather(*(one_tf(lbl, iv) for (lbl, iv) in STOCH_RSI_TFS))
     return {label: value for label, value in results}
+
+
+async def get_rsi_values(
+    session: aiohttp.ClientSession,
+    rate_limiter: RateLimiter,
+    sem: asyncio.Semaphore,
+    symbol: str,
+) -> Dict[str, float]:
+    async def one_tf(tf_label: str, interval: str) -> Tuple[str, float]:
+        async with sem:
+            closes = await get_kline_closes(session, rate_limiter, symbol, interval, KLINE_LIMIT)
+        value = rsi_wilder(closes, RSI_PERIOD)
+        if value is None:
+            raise BybitAPIError(f"Not enough data for RSI{RSI_PERIOD} {symbol} {tf_label}")
+        return tf_label, value
+
+    results = await asyncio.gather(*(one_tf(lbl, iv) for (lbl, iv) in TIMEFRAMES))
+    return {label: value for label, value in results}
+
+
+def format_rsi_line(values: Dict[str, float]) -> str:
+    parts = []
+    for label, _ in TIMEFRAMES:
+        value = values.get(label)
+        if value is None:
+            parts.append(f"{label} <code>n/a</code>")
+        else:
+            parts.append(f"{label} <code>{value:.2f}</code>")
+    return f"RSI{RSI_PERIOD}: " + " | ".join(parts)
+
+
+def format_rsi_line_for_labels(values: Dict[str, float], labels: List[str]) -> str:
+    parts = []
+    for label in labels:
+        value = values.get(label)
+        if value is None:
+            parts.append(f"{label} <code>n/a</code>")
+        else:
+            parts.append(f"{label} <code>{value:.2f}</code>")
+    return f"RSI{RSI_PERIOD}: " + " | ".join(parts)
 
 
 def format_stoch_rsi_line(values: Dict[str, float]) -> str:
@@ -873,6 +949,7 @@ def main_menu_kb(has_sub: bool) -> InlineKeyboardMarkup:
         [InlineKeyboardButton("➕ Создать подписку", callback_data="SUB_CREATE")],
         [InlineKeyboardButton("📋 Моя подписка", callback_data="SUB_VIEW")],
         [InlineKeyboardButton("⚡️ Прислать сейчас", callback_data="RUN_NOW")],
+        [InlineKeyboardButton("ℹ️ Информация по паре", callback_data="PAIR_INFO")],
     ]
     if has_sub:
         rows.append([InlineKeyboardButton("🗑 Удалить подписку", callback_data="SUB_DELETE")])
@@ -905,6 +982,41 @@ def alerts_kb(symbol: str, side: str) -> InlineKeyboardMarkup:
             InlineKeyboardButton("Alert 15m", callback_data=f"ALERT|15|{side}|{symbol}"),
             InlineKeyboardButton("Alert 30m", callback_data=f"ALERT|30|{side}|{symbol}"),
         ]]
+    )
+
+
+def pair_info_actions_kb(symbol: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("🔔 Отслеживать пару по RSI6", callback_data=f"PAIRTRACK|{symbol}")],
+            [InlineKeyboardButton("⬅️ Меню", callback_data="MENU")],
+        ]
+    )
+
+
+def pair_track_tf_kb(symbol: str, selected: Set[str]) -> InlineKeyboardMarkup:
+    rows: List[List[InlineKeyboardButton]] = []
+    labels = [label for label, _ in TIMEFRAMES]
+    for i in range(0, len(labels), 2):
+        row: List[InlineKeyboardButton] = []
+        for label in labels[i:i + 2]:
+            mark = "✅ " if label in selected else ""
+            row.append(
+                InlineKeyboardButton(f"{mark}{label}", callback_data=f"PAIRTRACK_TF|{symbol}|{label}")
+            )
+        rows.append(row)
+    rows.append([InlineKeyboardButton("✅ Готово", callback_data=f"PAIRTRACK_TF_CONFIRM|{symbol}")])
+    rows.append([InlineKeyboardButton("⬅️ Меню", callback_data="MENU")])
+    return InlineKeyboardMarkup(rows)
+
+
+def pair_track_range_kb(symbol: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton(f"RSI6 <= {PAIR_RSI_LOW_THRESHOLD:.0f}", callback_data=f"PAIRTRACK_RANGE|{symbol}|LOW")],
+            [InlineKeyboardButton(f"RSI6 >= {PAIR_RSI_HIGH_THRESHOLD:.0f}", callback_data=f"PAIRTRACK_RANGE|{symbol}|HIGH")],
+            [InlineKeyboardButton("⬅️ Назад", callback_data=f"PAIRTRACK_TF_BACK|{symbol}")],
+        ]
     )
 
 
@@ -976,6 +1088,97 @@ async def delete_sub(app: Application, chat_id: int) -> None:
         subs = state.setdefault("subs", {})
         subs.pop(str(chat_id), None)
         state_snapshot = json.dumps(state, ensure_ascii=False, indent=2)
+    if state_snapshot:
+        save_state_json(state_snapshot)
+
+
+def normalize_tf_labels(selected_labels: Set[str]) -> List[Tuple[str, str]]:
+    ordered = []
+    for label, interval in TIMEFRAMES:
+        if label in selected_labels:
+            ordered.append((label, interval))
+    return ordered
+
+
+async def get_pair_rsi_alerts_for_chat(app: Application, chat_id: int) -> Dict[str, dict]:
+    if not validate_chat_id(chat_id):
+        return {}
+    state_lock: asyncio.Lock = app.bot_data["state_lock"]
+    async with state_lock:
+        state = app.bot_data.get("state") or {"subs": {}, "alerts": {}, "pair_rsi_alerts": {}}
+        alerts = state.get("pair_rsi_alerts", {})
+        return alerts.get(str(chat_id), {})
+
+
+async def set_pair_rsi_alert_state(
+    app: Application,
+    chat_id: int,
+    symbol: str,
+    tf_intervals: List[str],
+    mode: str,
+    valid_symbols: Optional[Set[str]] = None,
+) -> Tuple[bool, Optional[str]]:
+    if not validate_chat_id(chat_id):
+        return False, "Некорректный chat_id."
+
+    if mode not in {"LOW", "HIGH"}:
+        return False, "Некорректный режим."
+
+    if valid_symbols is None or not valid_symbols:
+        valid_symbols = await get_valid_symbols_with_fallback(app)
+    if not valid_symbols:
+        return False, "Whitelist временно недоступен. Попробуйте позже."
+
+    if not validate_symbol(symbol, valid_symbols):
+        return False, "Некорректный символ."
+
+    allowed_intervals = {interval for _, interval in TIMEFRAMES}
+    if not tf_intervals or any(tf not in allowed_intervals for tf in tf_intervals):
+        return False, "Некорректные таймфреймы."
+
+    ordered_intervals = [interval for _, interval in TIMEFRAMES if interval in tf_intervals]
+    tf_labels = [TIMEFRAME_BY_INTERVAL[interval] for interval in ordered_intervals]
+    key = f"{symbol}|{','.join(ordered_intervals)}|{mode}"
+
+    state_lock: asyncio.Lock = app.bot_data["state_lock"]
+    state_snapshot: Optional[str] = None
+    async with state_lock:
+        state = app.bot_data.get("state") or {"subs": {}, "alerts": {}, "pair_rsi_alerts": {}}
+        alerts_all = state.setdefault("pair_rsi_alerts", {})
+        alerts = alerts_all.setdefault(str(chat_id), {})
+        is_new = key not in alerts
+        if is_new:
+            if len(alerts) >= MAX_ALERTS_PER_CHAT:
+                return False, f"Лимит алертов на чат ({MAX_ALERTS_PER_CHAT}) достигнут."
+            total_alerts = sum(len(a) for a in alerts_all.values())
+            if total_alerts >= MAX_ALERTS_GLOBAL:
+                return False, f"Глобальный лимит алертов ({MAX_ALERTS_GLOBAL}) достигнут."
+        alerts[key] = {
+            "symbol": symbol,
+            "tfs": ordered_intervals,
+            "tf_labels": tf_labels,
+            "mode": mode,
+            "created_at": time.time(),
+        }
+        app.bot_data["state"] = state
+        state_snapshot = json.dumps(state, ensure_ascii=False, indent=2)
+    if state_snapshot:
+        save_state_json(state_snapshot)
+    return True, None
+
+
+async def delete_pair_rsi_alert_state(app: Application, chat_id: int, key: str) -> None:
+    if not validate_chat_id(chat_id):
+        return
+    state_lock: asyncio.Lock = app.bot_data["state_lock"]
+    state_snapshot: Optional[str] = None
+    async with state_lock:
+        state = app.bot_data.get("state") or {"subs": {}, "alerts": {}, "pair_rsi_alerts": {}}
+        alerts = state.setdefault("pair_rsi_alerts", {}).setdefault(str(chat_id), {})
+        if key in alerts:
+            alerts.pop(key, None)
+            app.bot_data["state"] = state
+            state_snapshot = json.dumps(state, ensure_ascii=False, indent=2)
     if state_snapshot:
         save_state_json(state_snapshot)
 
@@ -1289,6 +1492,27 @@ def unschedule_alert(app: Application, chat_id: int, symbol: str, tf: str) -> No
         j.schedule_removal()
 
 
+def schedule_pair_rsi_alerts(app: Application, chat_id: int) -> None:
+    if not validate_chat_id(chat_id):
+        return
+    jobs = app.job_queue.get_jobs_by_name(get_pair_rsi_alert_job_name(chat_id))
+    for j in jobs:
+        j.schedule_removal()
+    app.job_queue.run_repeating(
+        pair_rsi_alert_job_callback,
+        interval=ALERT_CHECK_SEC,
+        first=2,
+        chat_id=chat_id,
+        name=get_pair_rsi_alert_job_name(chat_id),
+    )
+
+
+def unschedule_pair_rsi_alerts(app: Application, chat_id: int) -> None:
+    jobs = app.job_queue.get_jobs_by_name(get_pair_rsi_alert_job_name(chat_id))
+    for j in jobs:
+        j.schedule_removal()
+
+
 async def restore_alerts(app: Application) -> None:
     state_lock: asyncio.Lock = app.bot_data["state_lock"]
     state_snapshot: Optional[str] = None
@@ -1321,6 +1545,24 @@ async def restore_alerts(app: Application) -> None:
                     await schedule_alert(app, chat_id, symbol, tf, tf_label, side)
             except Exception as e:
                 logging.warning("Failed restoring alert: %s", e)
+
+
+async def restore_pair_rsi_alerts(app: Application) -> None:
+    state_lock: asyncio.Lock = app.bot_data["state_lock"]
+    async with state_lock:
+        state = app.bot_data.get("state") or {"subs": {}, "alerts": {}, "pair_rsi_alerts": {}}
+        alerts_all = copy.deepcopy(state.get("pair_rsi_alerts", {}) or {})
+
+    for chat_id_str, amap in alerts_all.items():
+        try:
+            chat_id = int(chat_id_str)
+            if not validate_chat_id(chat_id):
+                continue
+        except Exception:
+            continue
+        if not isinstance(amap, dict) or not amap:
+            continue
+        schedule_pair_rsi_alerts(app, chat_id)
 
 
 # =========================
@@ -1616,6 +1858,75 @@ async def alert_job_callback(context: ContextTypes.DEFAULT_TYPE):
                 logging.error("Failed to send alert error message to chat %s", chat_id)
 
 
+async def pair_rsi_alert_job_callback(context: ContextTypes.DEFAULT_TYPE):
+    chat_id = context.job.chat_id
+    app = context.application
+
+    alerts = await get_pair_rsi_alerts_for_chat(app, chat_id)
+    if not alerts:
+        unschedule_pair_rsi_alerts(app, chat_id)
+        return
+
+    session: aiohttp.ClientSession = app.bot_data["http_session"]
+    rate_limiter: RateLimiter = app.bot_data["rate_limiter"]
+    sem: asyncio.Semaphore = app.bot_data["http_sem"]
+
+    try:
+        valid_symbols = await get_valid_symbols_with_fallback(app)
+        if not valid_symbols:
+            logging.warning("Valid symbols whitelist unavailable for pair RSI alerts")
+            return
+
+        for key, entry in list(alerts.items()):
+            symbol = entry.get("symbol")
+            tf_intervals = entry.get("tfs") or []
+            tf_labels = entry.get("tf_labels") or [TIMEFRAME_BY_INTERVAL.get(tf, f"{tf}m") for tf in tf_intervals]
+            mode = entry.get("mode")
+            if not symbol or not tf_intervals or mode not in {"LOW", "HIGH"}:
+                await delete_pair_rsi_alert_state(app, chat_id, key)
+                continue
+            if not validate_symbol(symbol, valid_symbols):
+                await delete_pair_rsi_alert_state(app, chat_id, key)
+                continue
+
+            async def one_tf(interval: str) -> Tuple[str, float]:
+                async with sem:
+                    closes = await get_kline_closes(session, rate_limiter, symbol, interval, KLINE_LIMIT)
+                value = rsi_wilder(closes, RSI_PERIOD)
+                if value is None:
+                    raise BybitAPIError(f"Not enough data for RSI{RSI_PERIOD} {symbol} {interval}")
+                return interval, value
+
+            results = await asyncio.gather(*(one_tf(tf) for tf in tf_intervals))
+            values_by_label = {
+                TIMEFRAME_BY_INTERVAL.get(interval, f"{interval}m"): value
+                for interval, value in results
+            }
+
+            if mode == "LOW":
+                threshold = PAIR_RSI_LOW_THRESHOLD
+                condition_met = all(value <= threshold for value in values_by_label.values())
+                mode_label = f"<= {threshold:.0f}"
+            else:
+                threshold = PAIR_RSI_HIGH_THRESHOLD
+                condition_met = all(value >= threshold for value in values_by_label.values())
+                mode_label = f">= {threshold:.0f}"
+
+            if condition_met:
+                rsi_line = format_rsi_line_for_labels(values_by_label, tf_labels)
+                await app.bot.send_message(
+                    chat_id=chat_id,
+                    text=(
+                        f"🔔 RSI{RSI_PERIOD} {symbol} для таймфреймов {', '.join(tf_labels)} {mode_label}\n"
+                        f"{rsi_line}"
+                    ),
+                    parse_mode="HTML",
+                )
+                await delete_pair_rsi_alert_state(app, chat_id, key)
+    except Exception as e:
+        logging.exception("pair RSI alert job failed: %s", e)
+
+
 # =========================
 # CALLBACK HANDLERS
 # =========================
@@ -1631,6 +1942,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"SUM RSI({RSI_PERIOD}) по таймфреймам: {', '.join(lbl for (lbl, _) in TIMEFRAMES)}\n"
         "• Создай подписку (бот будет присылать картинку + список пар)\n"
         "• Нажми на пару в списке — получишь расчёт за последний час + кнопки Alerts\n"
+        "• Кнопка «Информация по паре» — вручную введи символ и получи RSI/Stoch RSI\n"
     )
     await update.message.reply_text(text, reply_markup=main_menu_kb(has_sub))
 
@@ -1638,6 +1950,43 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     app = context.application
+
+    if context.user_data.get("await_pair_info"):
+        raw_symbol = (update.message.text or "").strip()
+        symbol = normalize_symbol(raw_symbol)
+        if not symbol:
+            await update.message.reply_text("Введите торговую пару в формате BTCUSDT или BTC/USDT.")
+            return
+
+        valid_symbols = await get_valid_symbols_with_fallback(app)
+        if not valid_symbols:
+            await update.message.reply_text("Whitelist временно недоступен. Попробуйте позже.")
+            return
+
+        if not validate_symbol(symbol, valid_symbols):
+            await update.message.reply_text("Некорректный символ. Попробуйте ещё раз.")
+            return
+
+        context.user_data["await_pair_info"] = False
+        await update.message.reply_text(f"Считаю {symbol}…")
+
+        session: aiohttp.ClientSession = app.bot_data["http_session"]
+        rate_limiter: RateLimiter = app.bot_data["rate_limiter"]
+        sem: asyncio.Semaphore = app.bot_data["http_sem"]
+
+        try:
+            rsi_values = await get_rsi_values(session, rate_limiter, sem, symbol)
+            stoch_values = await get_stoch_rsi_values(session, rate_limiter, symbol, sem)
+        except Exception as e:
+            logging.exception("PAIR INFO calc failed: %s", e)
+            await update.message.reply_text(f"Ошибка расчёта {symbol}: {e}")
+            return
+
+        rsi_line = format_rsi_line(rsi_values)
+        stoch_line = format_stoch_rsi_line(stoch_values)
+        msg = f"<b>{symbol}</b>\n{rsi_line}\n{stoch_line}"
+        await update.message.reply_text(msg, parse_mode="HTML", reply_markup=pair_info_actions_kb(symbol))
+        return
 
     if context.user_data.get("await_interval"):
         raw = (update.message.text or "").strip()
@@ -1699,11 +2048,15 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if data == "MENU":
         context.user_data["await_interval"] = False
+        context.user_data["await_pair_info"] = False
+        context.user_data.pop("pair_track_symbol", None)
+        context.user_data.pop("pair_track_tfs", None)
         await query.edit_message_text("Меню RSI-бота:", reply_markup=main_menu_kb(has_sub))
         return
 
     if data == "SUB_CREATE":
         context.user_data["await_interval"] = True
+        context.user_data["await_pair_info"] = False
         await query.edit_message_text(
             "Введите интервал в минутах (например 15) сообщением в чат — или выберите кнопкой:",
             reply_markup=interval_picker_kb(),
@@ -1750,12 +2103,116 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if data == "RUN_NOW":
         context.user_data["await_interval"] = False
+        context.user_data["await_pair_info"] = False
         await app.bot.send_message(chat_id=chat_id, text="Собираю данные…")
         try:
             await run_monitor_once(app, chat_id)
         except Exception as e:
             logging.exception("RUN_NOW failed: %s", e)
             await app.bot.send_message(chat_id=chat_id, text=f"Ошибка: {e}")
+        return
+
+    if data == "PAIR_INFO":
+        context.user_data["await_pair_info"] = True
+        context.user_data["await_interval"] = False
+        context.user_data.pop("pair_track_symbol", None)
+        context.user_data.pop("pair_track_tfs", None)
+        await query.edit_message_text("Введите торговую пару (пример BTCUSDT или BTC/USDT):")
+        return
+
+    if data.startswith("PAIRTRACK|"):
+        try:
+            _, symbol = data.split("|", 1)
+        except ValueError:
+            return
+        valid_symbols = await get_valid_symbols_with_fallback(app)
+        if not valid_symbols:
+            await app.bot.send_message(chat_id=chat_id, text="Whitelist временно недоступен.")
+            return
+        if not validate_symbol(symbol, valid_symbols):
+            await app.bot.send_message(chat_id=chat_id, text="Некорректный символ.")
+            return
+        context.user_data["pair_track_symbol"] = symbol
+        context.user_data["pair_track_tfs"] = set()
+        await query.edit_message_text(
+            "Выберите таймфреймы для отслеживания (можно несколько):",
+            reply_markup=pair_track_tf_kb(symbol, set()),
+        )
+        return
+
+    if data.startswith("PAIRTRACK_TF|"):
+        parts = data.split("|")
+        if len(parts) != 3:
+            return
+        _, symbol, label = parts
+        if context.user_data.get("pair_track_symbol") != symbol:
+            context.user_data["pair_track_symbol"] = symbol
+            context.user_data["pair_track_tfs"] = set()
+        selected: Set[str] = context.user_data.get("pair_track_tfs", set())
+        if label in selected:
+            selected.remove(label)
+        else:
+            selected.add(label)
+        context.user_data["pair_track_tfs"] = selected
+        await query.edit_message_text(
+            "Выберите таймфреймы для отслеживания (можно несколько):",
+            reply_markup=pair_track_tf_kb(symbol, selected),
+        )
+        return
+
+    if data.startswith("PAIRTRACK_TF_CONFIRM|"):
+        _, symbol = data.split("|", 1)
+        selected: Set[str] = context.user_data.get("pair_track_tfs", set())
+        if not selected:
+            await app.bot.send_message(chat_id=chat_id, text="Выберите хотя бы один таймфрейм.")
+            return
+        await query.edit_message_text(
+            "Выберите диапазон для RSI6:",
+            reply_markup=pair_track_range_kb(symbol),
+        )
+        return
+
+    if data.startswith("PAIRTRACK_TF_BACK|"):
+        _, symbol = data.split("|", 1)
+        selected: Set[str] = context.user_data.get("pair_track_tfs", set())
+        await query.edit_message_text(
+            "Выберите таймфреймы для отслеживания (можно несколько):",
+            reply_markup=pair_track_tf_kb(symbol, selected),
+        )
+        return
+
+    if data.startswith("PAIRTRACK_RANGE|"):
+        parts = data.split("|")
+        if len(parts) != 3:
+            return
+        _, symbol, mode = parts
+        selected: Set[str] = context.user_data.get("pair_track_tfs", set())
+        if not selected:
+            await app.bot.send_message(chat_id=chat_id, text="Выберите таймфреймы для отслеживания.")
+            return
+        valid_symbols = await get_valid_symbols_with_fallback(app)
+        if not valid_symbols:
+            await app.bot.send_message(chat_id=chat_id, text="Whitelist временно недоступен.")
+            return
+        if not validate_symbol(symbol, valid_symbols):
+            await app.bot.send_message(chat_id=chat_id, text="Некорректный символ.")
+            return
+        tf_intervals = [interval for label, interval in normalize_tf_labels(selected)]
+        ok, err = await set_pair_rsi_alert_state(app, chat_id, symbol, tf_intervals, mode, valid_symbols)
+        if not ok:
+            await app.bot.send_message(chat_id=chat_id, text=err or "Не удалось создать отслеживание.")
+            return
+        schedule_pair_rsi_alerts(app, chat_id)
+        context.user_data.pop("pair_track_symbol", None)
+        context.user_data.pop("pair_track_tfs", None)
+        mode_label = (
+            f"<= {PAIR_RSI_LOW_THRESHOLD:.0f}" if mode == "LOW" else f">= {PAIR_RSI_HIGH_THRESHOLD:.0f}"
+        )
+        tf_labels = [label for label, _ in normalize_tf_labels(selected)]
+        await query.edit_message_text(
+            f"✅ Отслеживание включено: {symbol} RSI{RSI_PERIOD} {mode_label} "
+            f"для таймфреймов {', '.join(tf_labels)} (проверка каждые {ALERT_CHECK_SEC//60} мин)."
+        )
         return
 
     if data.startswith("SECTION|"):
@@ -1784,7 +2241,8 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             price = await get_last_price(session, rate_limiter, symbol)
             hi, lo = await get_last_hour_high_low(session, rate_limiter, symbol)
             try:
-                stoch_values = await get_stoch_rsi_values(session, rate_limiter, symbol)
+                sem: asyncio.Semaphore = app.bot_data["http_sem"]
+                stoch_values = await get_stoch_rsi_values(session, rate_limiter, symbol, sem)
             except Exception as e:
                 logging.warning("Failed to compute Stoch RSI for %s: %s", symbol, e)
                 stoch_values = {}
@@ -1940,6 +2398,7 @@ async def post_init(app: Application):
     app.bot_data["http_sem"] = asyncio.Semaphore(MAX_CONCURRENCY)
     app.bot_data["monitor_tasks"] = set()
     app.bot_data["state"] = load_state()
+    app.bot_data["state"].setdefault("pair_rsi_alerts", {})
     app.bot_data["perp_symbols_cache"] = None
     app.bot_data["tickers_cache"] = None
     app.bot_data["alert_cooldowns"] = {}
@@ -1966,6 +2425,9 @@ async def post_init(app: Application):
     # restore alerts
     await restore_alerts(app)
     logging.info("Restored alerts")
+
+    await restore_pair_rsi_alerts(app)
+    logging.info("Restored pair RSI alerts")
 
 
 async def post_shutdown(app: Application):
