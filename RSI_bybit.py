@@ -68,6 +68,10 @@ ALERT_EPS = float(os.getenv("ALERT_EPS", "0.10"))  # "equals threshold" toleranc
 ALERT_LONG_THRESHOLD = float(os.getenv("ALERT_LONG_THRESHOLD", "40"))
 ALERT_SHORT_THRESHOLD = float(os.getenv("ALERT_SHORT_THRESHOLD", "60"))
 ALERT_ERROR_THROTTLE_MIN = int(os.getenv("ALERT_ERROR_THROTTLE_MIN", "30"))
+MAX_ALERTS_PER_CHAT = int(os.getenv("MAX_ALERTS_PER_CHAT", "50"))
+MAX_ALERTS_GLOBAL = int(os.getenv("MAX_ALERTS_GLOBAL", "1000"))
+ALERT_TTL_HOURS = float(os.getenv("ALERT_TTL_HOURS", "24"))
+ALERT_COOLDOWN_SEC = int(os.getenv("ALERT_COOLDOWN_SEC", "0"))
 
 MAX_SYMBOLS = int(os.getenv("MAX_SYMBOLS", "200"))
 MAX_CONCURRENCY = int(os.getenv("MAX_CONCURRENCY", "20"))  # Increased from 10 for better performance
@@ -129,6 +133,14 @@ def validate_config() -> None:
         errors.append("ALERT_CHECK_SEC must be > 0")
     if ALERT_ERROR_THROTTLE_MIN <= 0:
         errors.append("ALERT_ERROR_THROTTLE_MIN must be > 0")
+    if MAX_ALERTS_PER_CHAT <= 0:
+        errors.append("MAX_ALERTS_PER_CHAT must be > 0")
+    if MAX_ALERTS_GLOBAL <= 0:
+        errors.append("MAX_ALERTS_GLOBAL must be > 0")
+    if ALERT_TTL_HOURS <= 0:
+        errors.append("ALERT_TTL_HOURS must be > 0")
+    if ALERT_COOLDOWN_SEC < 0:
+        errors.append("ALERT_COOLDOWN_SEC must be >= 0")
     if MAX_SYMBOLS <= 0:
         errors.append("MAX_SYMBOLS must be > 0")
     if MAX_CONCURRENCY <= 0:
@@ -172,7 +184,8 @@ logging.basicConfig(
 #               "tf":"15",
 #               "tf_label":"15m",
 #               "side":"L",
-#               "last_above": true/false/null
+#               "last_above": true/false/null,
+#               "created_at": 1717000000.0
 #           }
 #       }
 #   }
@@ -181,7 +194,12 @@ def load_state() -> dict:
     try:
         if os.path.exists(STATE_FILE):
             with open(STATE_FILE, "r", encoding="utf-8") as f:
-                return json.load(f)
+                state = json.load(f)
+            if validate_state(state):
+                return state
+            bad_name = f"{STATE_FILE}.bad-{int(time.time())}"
+            os.replace(STATE_FILE, bad_name)
+            logging.warning("Invalid state file moved to %s", bad_name)
     except Exception as e:
         logging.warning("Failed to load state: %s", e)
     return {"subs": {}, "alerts": {}}
@@ -193,8 +211,47 @@ def save_state(state: dict) -> None:
         with open(tmp, "w", encoding="utf-8") as f:
             json.dump(state, f, ensure_ascii=False, indent=2)
         os.replace(tmp, STATE_FILE)
+    except OSError as e:
+        if e.errno == 28:
+            logging.error("Failed to save state: no space left on device")
+            with contextlib.suppress(Exception):
+                if os.path.exists(tmp):
+                    os.remove(tmp)
+            return
+        logging.warning("Failed to save state: %s", e)
     except Exception as e:
         logging.warning("Failed to save state: %s", e)
+
+
+def validate_state(state: object) -> bool:
+    if not isinstance(state, dict):
+        return False
+    subs = state.get("subs", {})
+    alerts = state.get("alerts", {})
+    if not isinstance(subs, dict) or not isinstance(alerts, dict):
+        return False
+    for chat_id, sub in subs.items():
+        if not isinstance(chat_id, str) or not isinstance(sub, dict):
+            return False
+        interval = sub.get("interval_min")
+        if not isinstance(interval, int) or not validate_interval(interval):
+            return False
+    for chat_id, amap in alerts.items():
+        if not isinstance(chat_id, str) or not isinstance(amap, dict):
+            return False
+        for _, alert in amap.items():
+            if not isinstance(alert, dict):
+                return False
+            if not isinstance(alert.get("symbol"), str):
+                return False
+            if not isinstance(alert.get("tf"), str):
+                return False
+            if alert.get("side") not in {"L", "S"}:
+                return False
+            last_above = alert.get("last_above")
+            if last_above is not None and not isinstance(last_above, bool):
+                return False
+    return True
 
 
 def get_sub_job_name(chat_id: int) -> str:
@@ -820,6 +877,47 @@ async def get_alerts_for_chat(app: Application, chat_id: int) -> Dict[str, dict]
         return alerts.get(str(chat_id), {})
 
 
+def alert_ttl_seconds() -> float:
+    return ALERT_TTL_HOURS * 3600
+
+
+def is_alert_expired(created_at: float, now: Optional[float] = None) -> bool:
+    if now is None:
+        now = time.time()
+    return (now - float(created_at)) >= alert_ttl_seconds()
+
+
+def prune_expired_alerts(state: dict, now: Optional[float] = None) -> bool:
+    if now is None:
+        now = time.time()
+    changed = False
+    alerts_all = state.get("alerts", {}) or {}
+    for chat_id_str in list(alerts_all.keys()):
+        amap = alerts_all.get(chat_id_str)
+        if not isinstance(amap, dict):
+            alerts_all.pop(chat_id_str, None)
+            changed = True
+            continue
+        for key in list(amap.keys()):
+            entry = amap.get(key)
+            if not isinstance(entry, dict):
+                amap.pop(key, None)
+                changed = True
+                continue
+            created_at = entry.get("created_at")
+            if created_at is None:
+                entry["created_at"] = now
+                changed = True
+                continue
+            if is_alert_expired(created_at, now):
+                amap.pop(key, None)
+                changed = True
+        if not amap:
+            alerts_all.pop(chat_id_str, None)
+            changed = True
+    return changed
+
+
 async def set_alert_state(
     app: Application,
     chat_id: int,
@@ -828,31 +926,46 @@ async def set_alert_state(
     tf_label: str,
     side: str,
     last_above: Optional[bool] = None,
-) -> None:
+    valid_symbols: Optional[Set[str]] = None,
+) -> Tuple[bool, Optional[str]]:
     if not validate_chat_id(chat_id):
         logging.warning("Invalid chat_id for alert: %s", chat_id)
-        return
-    
-    valid_symbols = await get_valid_symbols_with_fallback(app)
-    
+        return False, "Некорректный chat_id."
+
+    if valid_symbols is None:
+        valid_symbols = await get_valid_symbols_with_fallback(app)
+
     if not validate_symbol(symbol, valid_symbols):
         logging.warning("Invalid symbol for alert: %s", symbol)
-        return
-    
+        return False, "Некорректный символ."
+
     state_lock: asyncio.Lock = app.bot_data["state_lock"]
     async with state_lock:
         state = app.bot_data.get("state") or {"subs": {}, "alerts": {}}
-        alerts = state.setdefault("alerts", {}).setdefault(str(chat_id), {})
+        now = time.time()
+        changed = prune_expired_alerts(state, now=now)
+        alerts_all = state.setdefault("alerts", {})
+        alerts = alerts_all.setdefault(str(chat_id), {})
         key = f"{symbol}|{tf}"
+        is_new = key not in alerts
+        if is_new:
+            if len(alerts) >= MAX_ALERTS_PER_CHAT:
+                return False, f"Лимит алертов на чат ({MAX_ALERTS_PER_CHAT}) достигнут."
+            total_alerts = sum(len(a) for a in alerts_all.values())
+            if total_alerts >= MAX_ALERTS_GLOBAL:
+                return False, f"Глобальный лимит алертов ({MAX_ALERTS_GLOBAL}) достигнут."
+        created_at = alerts.get(key, {}).get("created_at", now)
         alerts[key] = {
             "symbol": symbol,
             "tf": tf,
             "tf_label": tf_label,
             "side": side,
             "last_above": last_above,  # can be None
+            "created_at": created_at,
         }
         app.bot_data["state"] = state
         save_state(copy.deepcopy(state))
+        return True, None
 
 
 async def update_alert_last_above(app: Application, chat_id: int, symbol: str, tf: str, last_above: bool) -> None:
@@ -870,14 +983,35 @@ async def update_alert_last_above(app: Application, chat_id: int, symbol: str, t
             save_state(copy.deepcopy(state))
 
 
-async def delete_alert_state(app: Application, chat_id: int, symbol: str, tf: str) -> None:
+async def update_alert_created_at(app: Application, chat_id: int, symbol: str, tf: str, created_at: float) -> None:
     if not validate_chat_id(chat_id):
         return
 
-    valid_symbols = await get_valid_symbols_with_fallback(app)
+    state_lock: asyncio.Lock = app.bot_data["state_lock"]
+    async with state_lock:
+        state = app.bot_data.get("state") or {"subs": {}, "alerts": {}}
+        alerts = state.setdefault("alerts", {}).setdefault(str(chat_id), {})
+        key = f"{symbol}|{tf}"
+        if key in alerts:
+            alerts[key]["created_at"] = float(created_at)
+            app.bot_data["state"] = state
+            save_state(copy.deepcopy(state))
 
-    if not validate_symbol(symbol, valid_symbols):
+
+async def delete_alert_state(
+    app: Application,
+    chat_id: int,
+    symbol: str,
+    tf: str,
+    validate_symbol_check: bool = True,
+) -> None:
+    if not validate_chat_id(chat_id):
         return
+
+    if validate_symbol_check:
+        valid_symbols = await get_valid_symbols_with_fallback(app)
+        if not validate_symbol(symbol, valid_symbols):
+            return
 
     state_lock: asyncio.Lock = app.bot_data["state_lock"]
     async with state_lock:
@@ -1005,9 +1139,16 @@ def unschedule_alert(app: Application, chat_id: int, symbol: str, tf: str) -> No
         j.schedule_removal()
 
 
-def restore_alerts(app: Application) -> None:
-    state = app.bot_data.get("state") or {"subs": {}, "alerts": {}}
-    alerts_all = state.get("alerts", {}) or {}
+async def restore_alerts(app: Application) -> None:
+    state_lock: asyncio.Lock = app.bot_data["state_lock"]
+    async with state_lock:
+        state = app.bot_data.get("state") or {"subs": {}, "alerts": {}}
+        changed = prune_expired_alerts(state)
+        alerts_all = copy.deepcopy(state.get("alerts", {}) or {})
+        if changed:
+            app.bot_data["state"] = state
+            save_state(copy.deepcopy(state))
+
     for chat_id_str, amap in alerts_all.items():
         try:
             chat_id = int(chat_id_str)
@@ -1079,10 +1220,12 @@ async def run_monitor_once_internal(app: Application, chat_id: int):
     session: aiohttp.ClientSession = app.bot_data["http_session"]
     rate_limiter: RateLimiter = app.bot_data["rate_limiter"]
     symbols = await get_cached_top_symbols(app)
-    sem = asyncio.Semaphore(MAX_CONCURRENCY)
+    sem: asyncio.Semaphore = app.bot_data["http_sem"]
 
     results: List[Tuple[str, float, Dict[str, float]]] = []
-    tasks = [asyncio.create_task(compute_symbol_rsi_sum(session, rate_limiter, sem, s)) for s in symbols]
+    tasks = {
+        asyncio.create_task(compute_symbol_rsi_sum(session, rate_limiter, sem, s)): s for s in symbols
+    }
 
     # Track task statistics
     total_tasks = len(tasks)
@@ -1103,7 +1246,8 @@ async def run_monitor_once_internal(app: Application, chat_id: int):
                 error_count += 1
                 raise
             except Exception as e:
-                logging.warning("Failed to compute RSI for a symbol: %s", e)
+                symbol = tasks.get(task, "unknown")
+                logging.warning("Failed to compute RSI for %s: %s", symbol, e)
                 error_count += 1
                 continue
     finally:
@@ -1193,27 +1337,40 @@ async def alert_job_callback(context: ContextTypes.DEFAULT_TYPE):
     if not validate_chat_id(chat_id):
         logging.warning("Invalid chat_id for alert: %s", chat_id)
         return
-    
-    # Validate symbol with whitelist
+
     app = context.application
-    valid_symbols = await get_valid_symbols_with_fallback(app)
-    
-    if not validate_symbol(symbol, valid_symbols):
-        logging.warning("Invalid symbol for alert: %s", symbol)
+    key = f"{symbol}|{tf}"
+    alerts_map = await get_alerts_for_chat(app, chat_id)
+    entry = alerts_map.get(key)
+    if not entry:
+        unschedule_alert(app, chat_id, symbol, tf)
         return
 
+    created_at = entry.get("created_at")
+    if created_at is None:
+        await update_alert_created_at(app, chat_id, symbol, tf, time.time())
+    elif is_alert_expired(created_at):
+        unschedule_alert(app, chat_id, symbol, tf)
+        await delete_alert_state(app, chat_id, symbol, tf, validate_symbol_check=False)
+        return
+    
     session: aiohttp.ClientSession = app.bot_data["http_session"]
     rate_limiter: RateLimiter = app.bot_data["rate_limiter"]
 
     try:
-        closes = await get_kline_closes(session, rate_limiter, symbol, tf, KLINE_LIMIT)
+        sem: asyncio.Semaphore = app.bot_data["http_sem"]
+        async with sem:
+            valid_symbols = await get_valid_symbols_with_fallback(app)
+        if not validate_symbol(symbol, valid_symbols):
+            logging.warning("Invalid symbol for alert: %s", symbol)
+            return
+        async with sem:
+            closes = await get_kline_closes(session, rate_limiter, symbol, tf, KLINE_LIMIT)
         rsi = rsi_wilder(closes, RSI_PERIOD)
         if rsi is None:
             return
 
-        alerts_map = await get_alerts_for_chat(app, chat_id)
-        key = f"{symbol}|{tf}"
-        prev = alerts_map.get(key, {}).get("last_above", None)
+        prev = entry.get("last_above", None)
 
         if side == "L":
             threshold = ALERT_LONG_THRESHOLD
@@ -1531,8 +1688,35 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         threshold = ALERT_LONG_THRESHOLD if side == "L" else ALERT_SHORT_THRESHOLD
         trigger_label = f">= {threshold:.0f}" if side == "L" else f"<= {threshold:.0f}"
 
+        if ALERT_COOLDOWN_SEC > 0:
+            cooldowns = app.bot_data.setdefault("alert_cooldowns", {})
+            now = time.time()
+            last_ts = cooldowns.get(chat_id, 0.0)
+            remaining = ALERT_COOLDOWN_SEC - (now - last_ts)
+            if remaining > 0:
+                await app.bot.send_message(
+                    chat_id=chat_id,
+                    text=f"Подожди {int(math.ceil(remaining))} сек перед созданием нового алерта.",
+                )
+                return
+
         # Save alert with last_above = None (first check will set)
-        await set_alert_state(app, chat_id, symbol, tf, tf_label, side, last_above=None)
+        ok, err = await set_alert_state(
+            app,
+            chat_id,
+            symbol,
+            tf,
+            tf_label,
+            side,
+            last_above=None,
+            valid_symbols=valid_symbols,
+        )
+        if not ok:
+            await app.bot.send_message(chat_id=chat_id, text=err or "Не удалось создать алерт.")
+            return
+        if ALERT_COOLDOWN_SEC > 0:
+            cooldowns = app.bot_data.setdefault("alert_cooldowns", {})
+            cooldowns[chat_id] = time.time()
         schedule_alert(app, chat_id, symbol, tf, tf_label, side, valid_symbols)
 
         await app.bot.send_message(
@@ -1557,10 +1741,12 @@ async def post_init(app: Application):
     app.bot_data["state_lock"] = asyncio.Lock()
     app.bot_data["perp_symbols_lock"] = asyncio.Lock()
     app.bot_data["tickers_lock"] = asyncio.Lock()
+    app.bot_data["http_sem"] = asyncio.Semaphore(MAX_CONCURRENCY)
     app.bot_data["monitor_tasks"] = set()
     app.bot_data["state"] = load_state()
     app.bot_data["perp_symbols_cache"] = None
     app.bot_data["tickers_cache"] = None
+    app.bot_data["alert_cooldowns"] = {}
 
     # restore subscriptions with proper validation
     subs: dict = (app.bot_data["state"] or {}).get("subs", {})
@@ -1582,7 +1768,7 @@ async def post_init(app: Application):
             logging.warning("Failed to restore sub %s: %s", chat_id_str, e)
 
     # restore alerts
-    restore_alerts(app)
+    await restore_alerts(app)
     logging.info("Restored alerts")
 
 
