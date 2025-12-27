@@ -85,9 +85,10 @@ ERROR_RATE_THRESHOLD = 0.3  # 30%
 # Global rate limiter settings
 RATE_LIMIT_DELAY = 1.0  # Initial delay in seconds
 RATE_LIMIT_MAX_DELAY = 60.0  # Maximum delay
+RATE_LIMIT_QUEUE_TIMEOUT = 300  # Maximum time to wait in queue (5 minutes)
 
 # Timeout for monitor scanning (seconds)
-MONITOR_TIMEOUT = 600  # 10 minutes
+MONITOR_TIMEOUT = 900  # 15 minutes (increased from 10)
 
 # =========================
 # LOGGING
@@ -188,7 +189,7 @@ class BybitAPIError(Exception):
 
 
 class RateLimiter:
-    """Global rate limiter with dynamic backoff."""
+    """Global rate limiter with dynamic backoff and queue timeout."""
     
     def __init__(self):
         self._lock = asyncio.Lock()
@@ -197,14 +198,18 @@ class RateLimiter:
         self._rate_limited = False
     
     async def acquire(self):
-        """Acquire permission to make a request."""
-        async with self._lock:
-            now = time.time()
-            if self._rate_limited:
-                wait_time = self._delay - (now - self._last_request)
-                if wait_time > 0:
-                    await asyncio.sleep(wait_time)
-            self._last_request = time.time()
+        """Acquire permission to make a request with timeout."""
+        try:
+            async with asyncio.timeout(RATE_LIMIT_QUEUE_TIMEOUT):
+                async with self._lock:
+                    now = time.time()
+                    if self._rate_limited:
+                        wait_time = self._delay - (now - self._last_request)
+                        if wait_time > 0:
+                            await asyncio.sleep(wait_time)
+                    self._last_request = time.time()
+        except asyncio.TimeoutError:
+            raise BybitAPIError(f"Rate limiter queue timeout after {RATE_LIMIT_QUEUE_TIMEOUT}s")
     
     async def report_rate_limit(self):
         """Report that a rate limit was hit."""
@@ -513,6 +518,10 @@ def load_monospace_font(size: int) -> ImageFont.FreeTypeFont:
 
 
 def format_table_lines(title: str, rows: List[Tuple[str, float, Dict[str, float]]]) -> List[str]:
+    """Format table lines for rendering. Returns empty list if no rows."""
+    if not rows:
+        return []
+    
     sym_w = 16
     num_w = 6
 
@@ -543,9 +552,22 @@ def render_png(
         f"Symbols scanned: {symbols_scanned} (top by turnover24h)",
         "",
     ]
-    lines += format_table_lines("TOP-10 LONG (min SUM RSI6)", long_rows)
+    
+    # Format LONG table
+    long_lines = format_table_lines("TOP-10 LONG (min SUM RSI6)", long_rows)
+    if long_lines:
+        lines += long_lines
+    else:
+        lines += ["TOP-10 LONG (min SUM RSI6)", "No candidates found"]
+    
     lines += ["", ""]
-    lines += format_table_lines("TOP-10 SHORT (max SUM RSI6)", short_rows)
+    
+    # Format SHORT table
+    short_lines = format_table_lines("TOP-10 SHORT (max SUM RSI6)", short_rows)
+    if short_lines:
+        lines += short_lines
+    else:
+        lines += ["TOP-10 SHORT (max SUM RSI6)", "No candidates found"]
 
     font = load_monospace_font(FONT_SIZE)
 
@@ -890,15 +912,30 @@ def restore_alerts(app: Application) -> None:
 def build_pairs_text(long_syms: List[str], short_syms: List[str]) -> str:
     # only lists, no RSI values
     lines = []
-    lines.append("LONG:")
-    for s in long_syms:
-        lines.append(s)
+    
+    if long_syms:
+        lines.append("LONG:")
+        for s in long_syms:
+            lines.append(s)
+    else:
+        lines.append("LONG:")
+        lines.append("No candidates found")
+    
     lines.append("")
-    lines.append("SHORT:")
-    for s in short_syms:
-        lines.append(s)
+    
+    if short_syms:
+        lines.append("SHORT:")
+        for s in short_syms:
+            lines.append(s)
+    else:
+        lines.append("SHORT:")
+        lines.append("No candidates found")
+    
     lines.append("")
-    lines.append("Нажми на пару (кнопка) — получишь расчёт за последний час + кнопки Alerts.")
+    
+    if long_syms or short_syms:
+        lines.append("Нажми на пару (кнопка) — получишь расчёт за последний час + кнопки Alerts.")
+    
     return "\n".join(lines)
 
 
@@ -1261,10 +1298,11 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     msg += f"Risk/Reward: <b>{rr:.2f}</b>\n"
 
             else:
-                # SHORT: risk is current to high, reward is current to low
-                # FIX: Corrected sign interpretation
-                to_high = levered_pct(hi - price, price, LEVERAGE)  # positive (loss if price rises)
-                to_low = levered_pct(lo - price, price, LEVERAGE)   # negative (profit if price falls)
+                # SHORT: entry at current price
+                # If price goes UP to 1h high → loss (risk)
+                # If price goes DOWN to 1h low → profit (reward)
+                risk_pct = levered_pct(hi - price, price, LEVERAGE)  # positive percentage (loss)
+                reward_pct = levered_pct(price - lo, price, LEVERAGE)  # positive percentage (profit)
                 risk = (hi - price)  # distance to stop loss
                 reward = (price - lo)  # distance to take profit
                 rr = safe_rr(reward, risk)
@@ -1274,8 +1312,8 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     f"Current: <code>{price:.6f}</code>\n"
                     f"1h High: <code>{hi:.6f}</code>\n"
                     f"1h Low:  <code>{lo:.6f}</code>\n\n"
-                    f"To 1h high ({LEVERAGE:.0f}x): <b>{to_high:.2f}%</b> (risk)\n"
-                    f"To 1h low ({LEVERAGE:.0f}x): <b>{to_low:.2f}%</b> (profit)\n"
+                    f"<b>If price rises to 1h high:</b> <b>-{risk_pct:.2f}%</b> (LOSS at {LEVERAGE:.0f}x)\n"
+                    f"<b>If price falls to 1h low:</b> <b>+{reward_pct:.2f}%</b> (PROFIT at {LEVERAGE:.0f}x)\n"
                 )
                 if rr is None:
                     msg += "Risk/Reward: <b>∞</b>\n"
