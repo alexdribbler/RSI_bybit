@@ -85,6 +85,7 @@ MAX_ALERTS_PER_CHAT = int(os.getenv("MAX_ALERTS_PER_CHAT", "50"))
 MAX_ALERTS_GLOBAL = int(os.getenv("MAX_ALERTS_GLOBAL", "1000"))
 ALERT_TTL_HOURS = float(os.getenv("ALERT_TTL_HOURS", "24"))
 ALERT_COOLDOWN_SEC = int(os.getenv("ALERT_COOLDOWN_SEC", "0"))
+ALERT_MAX_BACKOFF_SEC = int(os.getenv("ALERT_MAX_BACKOFF_SEC", "3600"))
 SHUTDOWN_TASK_TIMEOUT = int(os.getenv("SHUTDOWN_TASK_TIMEOUT", "10"))
 CLEANUP_INTERVAL_SEC = int(os.getenv("CLEANUP_INTERVAL_SEC", "600"))
 
@@ -105,6 +106,10 @@ STATE_FILE = os.getenv("STATE_FILE", "bot_state.json")
 if not os.path.isabs(STATE_FILE):
     STATE_FILE = os.path.join(BASE_DIR, STATE_FILE)
 
+PERP_SYMBOLS_FILE = os.getenv("PERP_SYMBOLS_FILE", "perp_symbols.json")
+if not os.path.isabs(PERP_SYMBOLS_FILE):
+    PERP_SYMBOLS_FILE = os.path.join(BASE_DIR, PERP_SYMBOLS_FILE)
+
 # Subscription interval limits
 MIN_INTERVAL_MINUTES = 1
 MAX_INTERVAL_MINUTES = 1440
@@ -117,7 +122,7 @@ RATE_LIMIT_DELAY = 1.0  # Initial delay in seconds
 RATE_LIMIT_MAX_DELAY = 60.0  # Maximum delay
 RATE_LIMIT_QUEUE_TIMEOUT = 300  # Maximum time to wait in queue (5 minutes)
 RATE_LIMIT_MIN_SPACING = float(os.getenv("RATE_LIMIT_MIN_SPACING", "0.1"))
-API_GET_TOTAL_TIMEOUT = int(os.getenv("API_GET_TOTAL_TIMEOUT", "120"))
+API_GET_REQUEST_TIMEOUT = int(os.getenv("API_GET_REQUEST_TIMEOUT", "20"))
 
 # Timeout for monitor scanning (seconds)
 DEFAULT_MONITOR_TIMEOUT = max(
@@ -163,6 +168,8 @@ def validate_config() -> None:
         errors.append("ALERT_TTL_HOURS must be > 0")
     if ALERT_COOLDOWN_SEC < 0:
         errors.append("ALERT_COOLDOWN_SEC must be >= 0")
+    if ALERT_MAX_BACKOFF_SEC <= 0:
+        errors.append("ALERT_MAX_BACKOFF_SEC must be > 0")
     if MAX_SYMBOLS <= 0:
         errors.append("MAX_SYMBOLS must be > 0")
     if MAX_CONCURRENCY <= 0:
@@ -183,8 +190,8 @@ def validate_config() -> None:
         errors.append("RATE_LIMIT_QUEUE_TIMEOUT must be > 0")
     if RATE_LIMIT_MIN_SPACING <= 0:
         errors.append("RATE_LIMIT_MIN_SPACING must be > 0")
-    if API_GET_TOTAL_TIMEOUT <= 0:
-        errors.append("API_GET_TOTAL_TIMEOUT must be > 0")
+    if API_GET_REQUEST_TIMEOUT <= 0:
+        errors.append("API_GET_REQUEST_TIMEOUT must be > 0")
     if CLEANUP_INTERVAL_SEC <= 0:
         errors.append("CLEANUP_INTERVAL_SEC must be > 0")
     if MONITOR_TIMEOUT <= 0:
@@ -265,8 +272,44 @@ def save_state(state: dict) -> None:
     save_state_json(state_json)
 
 
+def load_perp_symbols() -> Set[str]:
+    if not os.path.exists(PERP_SYMBOLS_FILE):
+        return set()
+    try:
+        with open(PERP_SYMBOLS_FILE, "r", encoding="utf-8") as f:
+            payload = json.load(f)
+        if not isinstance(payload, list) or not all(isinstance(item, str) for item in payload):
+            logging.warning("Invalid perp symbols cache format, ignoring")
+            return set()
+        return set(payload)
+    except Exception as e:
+        logging.warning("Failed to load perp symbols cache: %s", e)
+        return set()
+
+
+def save_perp_symbols(symbols: Set[str]) -> None:
+    try:
+        payload = json.dumps(sorted(symbols), ensure_ascii=False, indent=2)
+    except Exception as e:
+        logging.warning("Failed to serialize perp symbols cache: %s", e)
+        return
+    tmp = PERP_SYMBOLS_FILE + ".tmp"
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            f.write(payload)
+        os.replace(tmp, PERP_SYMBOLS_FILE)
+    except Exception as e:
+        logging.warning("Failed to save perp symbols cache: %s", e)
+        with contextlib.suppress(Exception):
+            if os.path.exists(tmp):
+                os.remove(tmp)
+
+
 async def persist_state(app: Application, state: dict) -> None:
-    app.bot_data["state_save_pending"] = True
+    save_event: asyncio.Event = app.bot_data["state_save_event"]
+    save_done: asyncio.Event = app.bot_data["state_save_done"]
+    save_done.clear()
+    save_event.set()
     save_task: Optional[asyncio.Task] = app.bot_data.get("state_save_task")
     if save_task is None or save_task.done():
         app.bot_data["state_save_task"] = asyncio.create_task(state_save_worker(app))
@@ -274,8 +317,11 @@ async def persist_state(app: Application, state: dict) -> None:
 
 async def state_save_worker(app: Application) -> None:
     try:
-        while app.bot_data.get("state_save_pending"):
-            app.bot_data["state_save_pending"] = False
+        save_event: asyncio.Event = app.bot_data["state_save_event"]
+        save_done: asyncio.Event = app.bot_data["state_save_done"]
+        while True:
+            await save_event.wait()
+            save_event.clear()
             state_lock: asyncio.Lock = app.bot_data["state_lock"]
             async with state_lock:
                 snapshot = copy.deepcopy(
@@ -292,16 +338,17 @@ async def state_save_worker(app: Application) -> None:
             write_lock: asyncio.Lock = app.bot_data["state_write_lock"]
             async with write_lock:
                 save_state_json(state_json)
+            if not save_event.is_set():
+                save_done.set()
     except asyncio.CancelledError:
         raise
 
 
 async def flush_state(app: Application) -> None:
     await persist_state(app, app.bot_data.get("state") or {})
-    save_task: Optional[asyncio.Task] = app.bot_data.get("state_save_task")
-    if save_task:
-        with contextlib.suppress(asyncio.TimeoutError, asyncio.CancelledError):
-            await asyncio.wait_for(save_task, timeout=SHUTDOWN_TASK_TIMEOUT)
+    save_done: asyncio.Event = app.bot_data["state_save_done"]
+    with contextlib.suppress(asyncio.TimeoutError, asyncio.CancelledError):
+        await asyncio.wait_for(save_done.wait(), timeout=SHUTDOWN_TASK_TIMEOUT)
 
 
 def log_state_change(state: dict, op: str, **fields: object) -> None:
@@ -577,56 +624,52 @@ async def api_get_json(
     last_err: Optional[Exception] = None
     attempt = 0
 
-    try:
-        async with asyncio.timeout(API_GET_TOTAL_TIMEOUT):
-            while attempt < retries:
-                try:
-                    await rate_limiter.acquire()
+    while attempt < retries:
+        try:
+            await rate_limiter.acquire()
 
-                    async with session.get(
-                        url,
-                        params=params,
-                        timeout=aiohttp.ClientTimeout(total=20),
-                    ) as resp:
-                        if resp.status == 429:
-                            await rate_limiter.report_rate_limit()
-                            raise RateLimitError("Bybit rate limit: HTTP 429 (Too many requests)")
-                        data = await resp.json(content_type=None)
+            async with session.get(
+                url,
+                params=params,
+                timeout=aiohttp.ClientTimeout(total=API_GET_REQUEST_TIMEOUT),
+            ) as resp:
+                if resp.status == 429:
+                    await rate_limiter.report_rate_limit()
+                    raise RateLimitError("Bybit rate limit: HTTP 429 (Too many requests)")
+                data = await resp.json(content_type=None)
 
-                        if not isinstance(data, dict):
-                            raise BybitAPIError(
-                                f"Unexpected response payload type: {type(data).__name__}"
-                            )
+                if not isinstance(data, dict):
+                    raise BybitAPIError(
+                        f"Unexpected response payload type: {type(data).__name__}"
+                    )
 
-                        # Common rate limit code
-                        if data.get("retCode") == 10006:
-                            await rate_limiter.report_rate_limit()
-                            raise RateLimitError("Bybit rate limit: retCode=10006 (Too many visits!)")
+                # Common rate limit code
+                if data.get("retCode") == 10006:
+                    await rate_limiter.report_rate_limit()
+                    raise RateLimitError("Bybit rate limit: retCode=10006 (Too many visits!)")
 
-                        if resp.status >= 400:
-                            raise BybitAPIError(f"HTTP {resp.status}: {data}")
+                if resp.status >= 400:
+                    raise BybitAPIError(f"HTTP {resp.status}: {data}")
 
-                        if data.get("retCode") not in (0, None):
-                            raise BybitAPIError(
-                                f"Bybit retCode={data.get('retCode')} retMsg={data.get('retMsg')}"
-                            )
+                if data.get("retCode") not in (0, None):
+                    raise BybitAPIError(
+                        f"Bybit retCode={data.get('retCode')} retMsg={data.get('retMsg')}"
+                    )
 
-                        # Report success to gradually reduce delays
-                        await rate_limiter.report_success()
-                        return data
+                # Report success to gradually reduce delays
+                await rate_limiter.report_success()
+                return data
 
-                except RateLimitError as e:
-                    last_err = e
-                    continue
-                except (asyncio.TimeoutError, aiohttp.ClientError, BybitAPIError) as e:
-                    last_err = e
-                    attempt += 1
-                    if attempt >= retries:
-                        break
-                    await asyncio.sleep(backoff)
-                    backoff *= 1.7
-    except asyncio.TimeoutError as e:
-        last_err = e
+        except RateLimitError as e:
+            last_err = e
+            continue
+        except (asyncio.TimeoutError, aiohttp.ClientError, BybitAPIError) as e:
+            last_err = e
+            attempt += 1
+            if attempt >= retries:
+                break
+            await asyncio.sleep(backoff)
+            backoff *= 1.7
 
     raise BybitAPIError(f"Request failed after retries: {last_err}")
 
@@ -1709,7 +1752,7 @@ async def delete_alert_state(
 # =========================
 # CACHES
 # =========================
-async def get_cached_perp_symbols(app: Application) -> List[str]:
+async def get_cached_perp_symbols(app: Application) -> Set[str]:
     cache_lock: asyncio.Lock = app.bot_data["perp_symbols_lock"]
     async with cache_lock:
         now = time.time()
@@ -1719,8 +1762,9 @@ async def get_cached_perp_symbols(app: Application) -> List[str]:
 
         session: aiohttp.ClientSession = app.bot_data["http_session"]
         rate_limiter: RateLimiter = app.bot_data["rate_limiter"]
-        symbols = await get_all_usdt_linear_perp_symbols(session, rate_limiter)
+        symbols = set(await get_all_usdt_linear_perp_symbols(session, rate_limiter))
         app.bot_data["perp_symbols_cache"] = CacheItem(ts=now, value=symbols)
+        save_perp_symbols(symbols)
         return symbols
 
 
@@ -1736,7 +1780,7 @@ async def get_cached_top_symbols(app: Application) -> List[str]:
         rate_limiter: RateLimiter = app.bot_data["rate_limiter"]
         try:
             perp_symbols = await get_cached_perp_symbols(app)
-            top = await pick_top_symbols_by_turnover(session, rate_limiter, set(perp_symbols), MAX_SYMBOLS)
+            top = await pick_top_symbols_by_turnover(session, rate_limiter, perp_symbols, MAX_SYMBOLS)
         except Exception as e:
             if cached:
                 logging.warning("Failed to refresh tickers cache, using stale data: %s", e)
@@ -1807,7 +1851,14 @@ async def schedule_alert(
         first=2,
         chat_id=chat_id,
         name=name,
-        data={"symbol": symbol, "tf": tf, "tf_label": tf_label, "side": side},
+        data={
+            "symbol": symbol,
+            "tf": tf,
+            "tf_label": tf_label,
+            "side": side,
+            "backoff_sec": 0,
+            "next_retry_ts": 0.0,
+        },
     )
 
 
@@ -2002,7 +2053,7 @@ async def send_scan_result(app: Application, chat_id: int, long_rows, short_rows
     await app.bot.send_message(chat_id=chat_id, text=text, reply_markup=kb)
 
 
-async def run_monitor_once_internal(app: Application, chat_id: int):
+async def run_monitor_once_internal(app: Application, chat_id: int, timeout_sec: Optional[int] = None):
     """Internal monitor function without timeout wrapper."""
     start_ts = time.monotonic()
     session: aiohttp.ClientSession = app.bot_data["http_session"]
@@ -2050,14 +2101,21 @@ async def run_monitor_once_internal(app: Application, chat_id: int):
     worker_count = min(MAX_CONCURRENCY, total_tasks) if total_tasks else 0
     tasks = [asyncio.create_task(worker()) for _ in range(worker_count)]
 
+    timed_out = False
     try:
-        for local_results, local_success, local_error in await asyncio.gather(*tasks):
-            results.extend(local_results)
-            success_count += local_success
-            error_count += local_error
+        if tasks:
+            try:
+                for done in asyncio.as_completed(tasks, timeout=timeout_sec):
+                    local_results, local_success, local_error = await done
+                    results.extend(local_results)
+                    success_count += local_success
+                    error_count += local_error
+            except asyncio.TimeoutError:
+                timed_out = True
     finally:
         for task in tasks:
-            task.cancel()
+            if timed_out and not task.done():
+                task.cancel()
         if tasks:
             gather_task = asyncio.gather(*tasks, return_exceptions=True)
             try:
@@ -2067,7 +2125,8 @@ async def run_monitor_once_internal(app: Application, chat_id: int):
                 raise
 
     # Calculate error rate
-    error_rate = error_count / total_tasks if total_tasks > 0 else 0
+    processed_count = success_count + error_count
+    error_rate = error_count / processed_count if processed_count > 0 else 0
     duration = time.monotonic() - start_ts
     logging.debug(
         "monitor_done chat_id=%s symbols=%d success=%d errors=%d error_rate=%.3f duration=%.2fs",
@@ -2079,12 +2138,30 @@ async def run_monitor_once_internal(app: Application, chat_id: int):
         duration,
     )
     
+    if timed_out:
+        logging.warning(
+            "monitor_partial chat_id=%s processed=%d total=%d timeout=%ss",
+            chat_id,
+            processed_count,
+            total_tasks,
+            timeout_sec,
+        )
+        await app.bot.send_message(
+            chat_id=chat_id,
+            text=(
+                "⚠️ Мониторинг занял больше времени, отправляю частичный результат. "
+                "Остальные пары будут обработаны в следующем цикле."
+            ),
+        )
+
     # Notify user if error rate is high
     if error_rate > ERROR_RATE_THRESHOLD:
         await app.bot.send_message(
             chat_id=chat_id,
-            text=f"⚠️ Внимание: {error_count}/{total_tasks} символов не удалось обработать ({error_rate*100:.1f}% ошибок). "
-                 f"Возможны проблемы с API или rate limiting."
+            text=(
+                f"⚠️ Внимание: {error_count}/{processed_count} символов не удалось обработать "
+                f"({error_rate*100:.1f}% ошибок). Возможны проблемы с API или rate limiting."
+            )
         )
 
     if not results:
@@ -2100,7 +2177,7 @@ async def run_monitor_once_internal(app: Application, chat_id: int):
     long_rows = long_candidates[:10]
     short_rows = short_candidates[:10]
 
-    await send_scan_result(app, chat_id, long_rows, short_rows, symbols_scanned=total_tasks)
+    await send_scan_result(app, chat_id, long_rows, short_rows, symbols_scanned=processed_count)
 
 
 async def run_monitor_once(app: Application, chat_id: int):
@@ -2114,13 +2191,7 @@ async def run_monitor_once(app: Application, chat_id: int):
         current_delay = await rate_limiter.get_current_delay()
         delay_factor = max(1.0, current_delay / RATE_LIMIT_DELAY)
         adaptive_timeout = int(MONITOR_TIMEOUT * delay_factor)
-        await asyncio.wait_for(run_monitor_once_internal(app, chat_id), timeout=adaptive_timeout)
-    except asyncio.TimeoutError:
-        logging.error("Monitor timeout for chat_id=%s after %ds", chat_id, adaptive_timeout)
-        await app.bot.send_message(
-            chat_id=chat_id,
-            text=f"⚠️ Превышено время ожидания ({adaptive_timeout}с). Попробуйте позже."
-        )
+        await run_monitor_once_internal(app, chat_id, timeout_sec=adaptive_timeout)
     finally:
         if current_task:
             monitor_tasks.discard(current_task)
@@ -2142,8 +2213,9 @@ async def sub_job_callback(context: ContextTypes.DEFAULT_TYPE):
 
 
 async def alert_job_callback(context: ContextTypes.DEFAULT_TYPE):
-    chat_id = context.job.chat_id
-    data = context.job.data or {}
+    job = context.job
+    chat_id = job.chat_id
+    data = job.data or {}
     symbol = data.get("symbol")
     tf = data.get("tf")
     tf_label = data.get("tf_label") or f"{tf}m"
@@ -2163,6 +2235,10 @@ async def alert_job_callback(context: ContextTypes.DEFAULT_TYPE):
 
     app = context.application
     now = time.time()
+    backoff_sec = int(data.get("backoff_sec") or 0)
+    next_retry_ts = float(data.get("next_retry_ts") or 0.0)
+    if backoff_sec > 0 and now < next_retry_ts:
+        return
     notify_cache = app.bot_data.setdefault("alert_error_notify", {})
     ttl_sec = ALERT_ERROR_NOTIFY_TTL_HOURS * 3600
     last_prune = app.bot_data.get("alert_error_notify_last_prune", 0.0)
@@ -2250,6 +2326,9 @@ async def alert_job_callback(context: ContextTypes.DEFAULT_TYPE):
 
         await update_alert_last_above(app, chat_id, symbol, tf, condition_met)
 
+        if backoff_sec > 0:
+            data["backoff_sec"] = 0
+            data["next_retry_ts"] = 0.0
     except Exception as e:
         logging.exception("alert job failed for %s: %s", symbol, e)
         notify_key = (chat_id, symbol, tf)
@@ -2264,6 +2343,22 @@ async def alert_job_callback(context: ContextTypes.DEFAULT_TYPE):
                 notify_cache[notify_key] = now
             except Exception:
                 logging.error("Failed to send alert error message to chat %s", chat_id)
+
+        next_backoff = max(ALERT_CHECK_SEC, backoff_sec * 2 if backoff_sec else ALERT_CHECK_SEC)
+        next_backoff = min(next_backoff, ALERT_MAX_BACKOFF_SEC)
+        if next_backoff != backoff_sec:
+            data["backoff_sec"] = next_backoff
+            data["next_retry_ts"] = now + next_backoff
+            try:
+                await app.bot.send_message(
+                    chat_id=chat_id,
+                    text=(
+                        f"⚠️ Ошибка при проверке алерта {symbol}({tf_label}). "
+                        f"Увеличиваю интервал проверки до {int(next_backoff // 60)} мин."
+                    ),
+                )
+            except Exception:
+                logging.error("Failed to send alert backoff message to chat %s", chat_id)
 
 
 async def cleanup_job(context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -3059,8 +3154,10 @@ async def post_init(app: Application):
     app.bot_data["rate_limiter"] = RateLimiter()
     app.bot_data["state_lock"] = asyncio.Lock()
     app.bot_data["state_write_lock"] = asyncio.Lock()
-    app.bot_data["state_save_pending"] = False
-    app.bot_data["state_save_task"] = None
+    app.bot_data["state_save_event"] = asyncio.Event()
+    app.bot_data["state_save_done"] = asyncio.Event()
+    app.bot_data["state_save_done"].set()
+    app.bot_data["state_save_task"] = asyncio.create_task(state_save_worker(app))
     app.bot_data["perp_symbols_lock"] = asyncio.Lock()
     app.bot_data["tickers_lock"] = asyncio.Lock()
     app.bot_data["http_sem"] = asyncio.Semaphore(MAX_CONCURRENCY)
@@ -3069,6 +3166,9 @@ async def post_init(app: Application):
     app.bot_data["state"].setdefault("pair_rsi_alerts", {})
     app.bot_data["state"].setdefault("price_alerts", {})
     app.bot_data["perp_symbols_cache"] = None
+    cached_symbols = load_perp_symbols()
+    if cached_symbols:
+        app.bot_data["perp_symbols_cache"] = CacheItem(ts=0.0, value=cached_symbols)
     app.bot_data["tickers_cache"] = None
     app.bot_data["alert_cooldowns"] = {}
     app.bot_data["alert_error_notify"] = {}
