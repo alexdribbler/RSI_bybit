@@ -86,6 +86,9 @@ ERROR_RATE_THRESHOLD = 0.3  # 30%
 RATE_LIMIT_DELAY = 1.0  # Initial delay in seconds
 RATE_LIMIT_MAX_DELAY = 60.0  # Maximum delay
 
+# Timeout for monitor scanning (seconds)
+MONITOR_TIMEOUT = 600  # 10 minutes
+
 # =========================
 # LOGGING
 # =========================
@@ -148,11 +151,15 @@ def validate_symbol(symbol: str, valid_symbols: Optional[Set[str]] = None) -> bo
         symbol: Symbol to validate
         valid_symbols: Optional whitelist of valid symbols from Bybit API
     """
-    if not isinstance(symbol, str) or len(symbol) > 20:
+    if not isinstance(symbol, str) or len(symbol) > 20 or len(symbol) < 3:
         return False
     
-    # Basic validation: alphanumeric plus allowed special chars
-    if not all(c.isalnum() or c in "-_" for c in symbol):
+    # Bybit format: only uppercase alphanumeric, must end with USDT
+    if not symbol.isupper() or not symbol.endswith("USDT"):
+        return False
+    
+    # Only alphanumeric characters allowed (no dashes or underscores in Bybit perpetuals)
+    if not symbol.isalnum():
         return False
     
     # If whitelist provided, check against it
@@ -249,6 +256,7 @@ async def api_get_json(
                 if isinstance(data, dict) and data.get("retCode") not in (0, None):
                     raise BybitAPIError(f"Bybit retCode={data.get('retCode')} retMsg={data.get('retMsg')}")
 
+                # FIX: Report success to gradually reduce delays
                 await rate_limiter.report_success()
                 return data
 
@@ -477,10 +485,14 @@ async def get_last_hour_high_low(session: aiohttp.ClientSession, rate_limiter: R
 
 
 def levered_pct(delta: float, price: float, lev: float) -> float:
+    """Calculate leveraged percentage change."""
+    if price == 0:
+        return 0.0
     return (delta / price) * 100.0 * lev
 
 
 def safe_rr(reward: float, risk: float) -> Optional[float]:
+    """Calculate risk/reward ratio safely."""
     if risk <= 0:
         return None
     return reward / risk
@@ -872,7 +884,8 @@ async def send_scan_result(app: Application, chat_id: int, long_rows, short_rows
     await app.bot.send_message(chat_id=chat_id, text=text, reply_markup=kb)
 
 
-async def run_monitor_once(app: Application, chat_id: int):
+async def run_monitor_once_internal(app: Application, chat_id: int):
+    """Internal monitor function without timeout wrapper."""
     session: aiohttp.ClientSession = app.bot_data["http_session"]
     rate_limiter: RateLimiter = app.bot_data["rate_limiter"]
     symbols = await get_cached_top_symbols(app)
@@ -924,6 +937,18 @@ async def run_monitor_once(app: Application, chat_id: int):
     short_rows = short_candidates[:10]
 
     await send_scan_result(app, chat_id, long_rows, short_rows, symbols_scanned=success_count)
+
+
+async def run_monitor_once(app: Application, chat_id: int):
+    """Run monitor with timeout protection."""
+    try:
+        await asyncio.wait_for(run_monitor_once_internal(app, chat_id), timeout=MONITOR_TIMEOUT)
+    except asyncio.TimeoutError:
+        logging.error("Monitor timeout for chat_id=%s after %ds", chat_id, MONITOR_TIMEOUT)
+        await app.bot.send_message(
+            chat_id=chat_id,
+            text=f"⚠️ Превышено время ожидания ({MONITOR_TIMEOUT}с). Попробуйте позже."
+        )
 
 
 # =========================
@@ -1181,10 +1206,11 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             hi, lo = await get_last_hour_high_low(session, rate_limiter, symbol)
 
             if side == "L":
-                dd = levered_pct(lo - price, price, LEVERAGE)     # negative
-                up = levered_pct(hi - price, price, LEVERAGE)     # positive
-                risk = (price - lo)
-                reward = (hi - price)
+                # LONG: risk is current to low, reward is current to high
+                dd = levered_pct(lo - price, price, LEVERAGE)     # negative (to low)
+                up = levered_pct(hi - price, price, LEVERAGE)     # positive (to high)
+                risk = (price - lo)  # distance to stop loss
+                reward = (hi - price)  # distance to take profit
                 rr = safe_rr(reward, risk)
 
                 msg = (
@@ -1192,8 +1218,8 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     f"Current: <code>{price:.6f}</code>\n"
                     f"1h Low:  <code>{lo:.6f}</code>\n"
                     f"1h High: <code>{hi:.6f}</code>\n\n"
-                    f"To 1h low (20x): <b>{dd:.2f}%</b>\n"
-                    f"To 1h high (20x): <b>{up:.2f}%</b>\n"
+                    f"To 1h low ({LEVERAGE:.0f}x): <b>{dd:.2f}%</b>\n"
+                    f"To 1h high ({LEVERAGE:.0f}x): <b>{up:.2f}%</b>\n"
                 )
                 if rr is None:
                     msg += "Risk/Reward: <b>∞</b>\n"
@@ -1201,11 +1227,12 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     msg += f"Risk/Reward: <b>{rr:.2f}</b>\n"
 
             else:
-                # SHORT
-                to_high = levered_pct(price - hi, price, LEVERAGE)  # negative (loss)
-                to_low = levered_pct(price - lo, price, LEVERAGE)   # positive (profit if price falls)
-                risk = (hi - price)
-                reward = (price - lo)
+                # SHORT: risk is current to high, reward is current to low
+                # FIX: Corrected sign interpretation
+                to_high = levered_pct(hi - price, price, LEVERAGE)  # positive (loss if price rises)
+                to_low = levered_pct(lo - price, price, LEVERAGE)   # negative (profit if price falls)
+                risk = (hi - price)  # distance to stop loss
+                reward = (price - lo)  # distance to take profit
                 rr = safe_rr(reward, risk)
 
                 msg = (
@@ -1213,8 +1240,8 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     f"Current: <code>{price:.6f}</code>\n"
                     f"1h High: <code>{hi:.6f}</code>\n"
                     f"1h Low:  <code>{lo:.6f}</code>\n\n"
-                    f"To 1h high (20x): <b>{to_high:.2f}%</b>\n"
-                    f"To 1h low (20x): <b>{to_low:.2f}%</b>\n"
+                    f"To 1h high ({LEVERAGE:.0f}x): <b>{to_high:.2f}%</b> (risk)\n"
+                    f"To 1h low ({LEVERAGE:.0f}x): <b>{to_low:.2f}%</b> (profit)\n"
                 )
                 if rr is None:
                     msg += "Risk/Reward: <b>∞</b>\n"
