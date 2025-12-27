@@ -86,6 +86,7 @@ MAX_ALERTS_GLOBAL = int(os.getenv("MAX_ALERTS_GLOBAL", "1000"))
 ALERT_TTL_HOURS = float(os.getenv("ALERT_TTL_HOURS", "24"))
 ALERT_COOLDOWN_SEC = int(os.getenv("ALERT_COOLDOWN_SEC", "0"))
 SHUTDOWN_TASK_TIMEOUT = int(os.getenv("SHUTDOWN_TASK_TIMEOUT", "10"))
+CLEANUP_INTERVAL_SEC = int(os.getenv("CLEANUP_INTERVAL_SEC", "600"))
 
 MAX_SYMBOLS = int(os.getenv("MAX_SYMBOLS", "200"))
 MAX_CONCURRENCY = int(os.getenv("MAX_CONCURRENCY", "20"))  # Increased from 10 for better performance
@@ -116,6 +117,7 @@ RATE_LIMIT_DELAY = 1.0  # Initial delay in seconds
 RATE_LIMIT_MAX_DELAY = 60.0  # Maximum delay
 RATE_LIMIT_QUEUE_TIMEOUT = 300  # Maximum time to wait in queue (5 minutes)
 RATE_LIMIT_MIN_SPACING = float(os.getenv("RATE_LIMIT_MIN_SPACING", "0.1"))
+API_GET_TOTAL_TIMEOUT = int(os.getenv("API_GET_TOTAL_TIMEOUT", "120"))
 
 # Timeout for monitor scanning (seconds)
 DEFAULT_MONITOR_TIMEOUT = max(
@@ -181,6 +183,10 @@ def validate_config() -> None:
         errors.append("RATE_LIMIT_QUEUE_TIMEOUT must be > 0")
     if RATE_LIMIT_MIN_SPACING <= 0:
         errors.append("RATE_LIMIT_MIN_SPACING must be > 0")
+    if API_GET_TOTAL_TIMEOUT <= 0:
+        errors.append("API_GET_TOTAL_TIMEOUT must be > 0")
+    if CLEANUP_INTERVAL_SEC <= 0:
+        errors.append("CLEANUP_INTERVAL_SEC must be > 0")
     if MONITOR_TIMEOUT <= 0:
         errors.append("MONITOR_TIMEOUT must be > 0")
 
@@ -229,22 +235,25 @@ def load_state() -> dict:
     return {"subs": {}, "alerts": {}, "pair_rsi_alerts": {}, "price_alerts": {}}
 
 
-def save_state_json(state_json: str) -> None:
+def save_state_json(state_json: str) -> bool:
     try:
         tmp = STATE_FILE + ".tmp"
         with open(tmp, "w", encoding="utf-8") as f:
             f.write(state_json)
         os.replace(tmp, STATE_FILE)
+        logging.debug("State saved to %s (%d bytes)", STATE_FILE, len(state_json))
+        return True
     except OSError as e:
         if e.errno == 28:
             logging.error("Failed to save state: no space left on device")
             with contextlib.suppress(Exception):
                 if os.path.exists(tmp):
                     os.remove(tmp)
-            return
+            return False
         logging.warning("Failed to save state: %s", e)
     except Exception as e:
         logging.warning("Failed to save state: %s", e)
+    return False
 
 
 def save_state(state: dict) -> None:
@@ -254,6 +263,34 @@ def save_state(state: dict) -> None:
         logging.warning("Failed to serialize state: %s", e)
         return
     save_state_json(state_json)
+
+
+async def persist_state(app: Application, state: dict) -> None:
+    try:
+        state_json = json.dumps(state, ensure_ascii=False, indent=2)
+    except Exception as e:
+        logging.warning("Failed to serialize state: %s", e)
+        return
+    write_lock: asyncio.Lock = app.bot_data["state_write_lock"]
+    async with write_lock:
+        save_state_json(state_json)
+
+
+def log_state_change(state: dict, op: str, **fields: object) -> None:
+    subs_total = len(state.get("subs", {}) or {})
+    alerts_total = sum(len(v) for v in (state.get("alerts", {}) or {}).values())
+    pair_total = sum(len(v) for v in (state.get("pair_rsi_alerts", {}) or {}).values())
+    price_total = sum(len(v) for v in (state.get("price_alerts", {}) or {}).values())
+    details = " ".join(f"{key}={value}" for key, value in fields.items())
+    logging.debug(
+        "state_op=%s %s subs_total=%d alerts_total=%d pair_rsi_total=%d price_alerts_total=%d",
+        op,
+        details,
+        subs_total,
+        alerts_total,
+        pair_total,
+        price_total,
+    )
 
 
 def validate_state(state: object) -> bool:
@@ -442,6 +479,10 @@ class BybitAPIError(Exception):
     pass
 
 
+class RateLimitError(BybitAPIError):
+    pass
+
+
 class RateLimiter:
     """Global rate limiter with dynamic backoff and queue timeout."""
     
@@ -506,50 +547,58 @@ async def api_get_json(
 ) -> dict:
     backoff = 0.8
     last_err: Optional[Exception] = None
+    attempt = 0
 
-    for attempt in range(retries):
-        try:
-            await rate_limiter.acquire()
-            
-            async with session.get(
-                url,
-                params=params,
-                timeout=aiohttp.ClientTimeout(total=20),
-            ) as resp:
-                if resp.status in {429, 503}:
-                    retry_after = resp.headers.get("Retry-After")
-                    await rate_limiter.report_rate_limit()
-                    if retry_after:
-                        try:
-                            await asyncio.sleep(float(retry_after))
-                        except (TypeError, ValueError):
-                            pass
-                data = await resp.json(content_type=None)
+    try:
+        async with asyncio.timeout(API_GET_TOTAL_TIMEOUT):
+            while attempt < retries:
+                try:
+                    await rate_limiter.acquire()
 
-                if not isinstance(data, dict):
-                    raise BybitAPIError(f"Unexpected response payload type: {type(data).__name__}")
+                    async with session.get(
+                        url,
+                        params=params,
+                        timeout=aiohttp.ClientTimeout(total=20),
+                    ) as resp:
+                        if resp.status == 429:
+                            await rate_limiter.report_rate_limit()
+                            raise RateLimitError("Bybit rate limit: HTTP 429 (Too many requests)")
+                        data = await resp.json(content_type=None)
 
-                # Common rate limit code
-                if isinstance(data, dict) and data.get("retCode") == 10006:
-                    await rate_limiter.report_rate_limit()
-                    raise BybitAPIError("Bybit rate limit: retCode=10006 (Too many visits!)")
+                        if not isinstance(data, dict):
+                            raise BybitAPIError(
+                                f"Unexpected response payload type: {type(data).__name__}"
+                            )
 
-                if resp.status >= 400:
-                    raise BybitAPIError(f"HTTP {resp.status}: {data}")
+                        # Common rate limit code
+                        if data.get("retCode") == 10006:
+                            await rate_limiter.report_rate_limit()
+                            raise RateLimitError("Bybit rate limit: retCode=10006 (Too many visits!)")
 
-                if data.get("retCode") not in (0, None):
-                    raise BybitAPIError(f"Bybit retCode={data.get('retCode')} retMsg={data.get('retMsg')}")
+                        if resp.status >= 400:
+                            raise BybitAPIError(f"HTTP {resp.status}: {data}")
 
-                # Report success to gradually reduce delays
-                await rate_limiter.report_success()
-                return data
+                        if data.get("retCode") not in (0, None):
+                            raise BybitAPIError(
+                                f"Bybit retCode={data.get('retCode')} retMsg={data.get('retMsg')}"
+                            )
 
-        except (asyncio.TimeoutError, aiohttp.ClientError, BybitAPIError) as e:
-            last_err = e
-            if attempt == retries - 1:
-                break
-            await asyncio.sleep(backoff)
-            backoff *= 1.7
+                        # Report success to gradually reduce delays
+                        await rate_limiter.report_success()
+                        return data
+
+                except RateLimitError as e:
+                    last_err = e
+                    continue
+                except (asyncio.TimeoutError, aiohttp.ClientError, BybitAPIError) as e:
+                    last_err = e
+                    attempt += 1
+                    if attempt >= retries:
+                        break
+                    await asyncio.sleep(backoff)
+                    backoff *= 1.7
+    except asyncio.TimeoutError as e:
+        last_err = e
 
     raise BybitAPIError(f"Request failed after retries: {last_err}")
 
@@ -796,10 +845,26 @@ async def get_last_price(session: aiohttp.ClientSession, rate_limiter: RateLimit
     if not items:
         raise BybitAPIError(f"Ticker empty for {symbol}")
     it = items[0]
-    try:
-        return float(it.get("lastPrice"))
-    except Exception:
-        raise BybitAPIError(f"Bad lastPrice for {symbol}: {it.get('lastPrice')}")
+    def as_finite_float(value: object) -> Optional[float]:
+        try:
+            parsed = float(value)
+        except (TypeError, ValueError):
+            return None
+        return parsed if math.isfinite(parsed) else None
+
+    price = (
+        as_finite_float(it.get("lastPrice"))
+        or as_finite_float(it.get("markPrice"))
+        or as_finite_float(it.get("indexPrice"))
+    )
+    if price is None:
+        bid = as_finite_float(it.get("bid1Price"))
+        ask = as_finite_float(it.get("ask1Price"))
+        if bid is not None and ask is not None and bid > 0 and ask > 0:
+            price = (bid + ask) / 2
+    if price is None:
+        raise BybitAPIError(f"No valid price for {symbol}: {it}")
+    return price
 
 
 async def get_last_hour_high_low(session: aiohttp.ClientSession, rate_limiter: RateLimiter, symbol: str) -> Tuple[float, float]:
@@ -1163,7 +1228,8 @@ async def set_sub(app: Application, chat_id: int, interval_min: int, enabled: bo
         state.setdefault("subs", {})
         state["subs"][str(chat_id)] = {"interval_min": int(interval_min), "enabled": bool(enabled)}
         app.bot_data["state"] = state
-        save_state_json(json.dumps(state, ensure_ascii=False, indent=2))
+        log_state_change(state, "set_sub", chat_id=chat_id, interval_min=interval_min, enabled=enabled)
+        await persist_state(app, state)
 
 
 async def delete_sub(app: Application, chat_id: int) -> None:
@@ -1180,7 +1246,8 @@ async def delete_sub(app: Application, chat_id: int) -> None:
         }
         subs = state.setdefault("subs", {})
         subs.pop(str(chat_id), None)
-        save_state_json(json.dumps(state, ensure_ascii=False, indent=2))
+        log_state_change(state, "delete_sub", chat_id=chat_id)
+        await persist_state(app, state)
 
 
 def normalize_tf_labels(selected_labels: Set[str]) -> List[Tuple[str, str]]:
@@ -1256,7 +1323,15 @@ async def set_pair_rsi_alert_state(
             "created_at": time.time(),
         }
         app.bot_data["state"] = state
-        save_state_json(json.dumps(state, ensure_ascii=False, indent=2))
+        log_state_change(
+            state,
+            "set_pair_rsi_alert_state",
+            chat_id=chat_id,
+            symbol=symbol,
+            mode=mode,
+            tfs=",".join(ordered_intervals),
+        )
+        await persist_state(app, state)
     return True, None
 
 
@@ -1313,7 +1388,15 @@ async def set_price_alert_state(
             "created_at": time.time(),
         }
         app.bot_data["state"] = state
-        save_state_json(json.dumps(state, ensure_ascii=False, indent=2))
+        log_state_change(
+            state,
+            "set_price_alert_state",
+            chat_id=chat_id,
+            symbol=symbol,
+            direction=direction,
+            price=price_text,
+        )
+        await persist_state(app, state)
     return True, None, key
 
 
@@ -1327,7 +1410,8 @@ async def delete_price_alert_state(app: Application, chat_id: int, key: str) -> 
         if key in alerts:
             alerts.pop(key, None)
             app.bot_data["state"] = state
-            save_state_json(json.dumps(state, ensure_ascii=False, indent=2))
+            log_state_change(state, "delete_price_alert_state", chat_id=chat_id, key=key)
+            await persist_state(app, state)
 
 
 async def delete_pair_rsi_alert_state(app: Application, chat_id: int, key: str) -> None:
@@ -1345,7 +1429,8 @@ async def delete_pair_rsi_alert_state(app: Application, chat_id: int, key: str) 
         if key in alerts:
             alerts.pop(key, None)
             app.bot_data["state"] = state
-            save_state_json(json.dumps(state, ensure_ascii=False, indent=2))
+            log_state_change(state, "delete_pair_rsi_alert_state", chat_id=chat_id, key=key)
+            await persist_state(app, state)
 
 
 async def get_alerts_for_chat(app: Application, chat_id: int) -> Dict[str, dict]:
@@ -1376,6 +1461,14 @@ def is_alert_expired(created_at: float, now: Optional[float] = None) -> bool:
     except (TypeError, ValueError):
         return True
     return (now - created_at_ts) >= alert_ttl_seconds()
+
+
+def prune_ttl_dict(cache: Dict[object, float], ttl_sec: float, now: float) -> None:
+    if ttl_sec <= 0:
+        return
+    for key, last_seen in list(cache.items()):
+        if now - last_seen >= ttl_sec:
+            del cache[key]
 
 
 def prune_expired_alerts(state: dict, now: Optional[float] = None) -> bool:
@@ -1463,7 +1556,15 @@ async def set_alert_state(
             "created_at": created_at,
         }
         app.bot_data["state"] = state
-        save_state_json(json.dumps(state, ensure_ascii=False, indent=2))
+        log_state_change(
+            state,
+            "set_alert_state",
+            chat_id=chat_id,
+            symbol=symbol,
+            tf=tf,
+            side=side,
+        )
+        await persist_state(app, state)
     return True, None
 
 
@@ -1493,7 +1594,15 @@ async def update_alert_last_above(app: Application, chat_id: int, symbol: str, t
         if key in alerts:
             alerts[key]["last_above"] = bool(last_above)
             app.bot_data["state"] = state
-            save_state_json(json.dumps(state, ensure_ascii=False, indent=2))
+            log_state_change(
+                state,
+                "update_alert_last_above",
+                chat_id=chat_id,
+                symbol=symbol,
+                tf=tf,
+                last_above=last_above,
+            )
+            await persist_state(app, state)
 
 
 async def update_alert_created_at(app: Application, chat_id: int, symbol: str, tf: str, created_at: float) -> None:
@@ -1522,7 +1631,15 @@ async def update_alert_created_at(app: Application, chat_id: int, symbol: str, t
         if key in alerts:
             alerts[key]["created_at"] = float(created_at)
             app.bot_data["state"] = state
-            save_state_json(json.dumps(state, ensure_ascii=False, indent=2))
+            log_state_change(
+                state,
+                "update_alert_created_at",
+                chat_id=chat_id,
+                symbol=symbol,
+                tf=tf,
+                created_at=created_at,
+            )
+            await persist_state(app, state)
 
 
 async def delete_alert_state(
@@ -1555,7 +1672,8 @@ async def delete_alert_state(
         if key in alerts:
             alerts.pop(key, None)
             app.bot_data["state"] = state
-            save_state_json(json.dumps(state, ensure_ascii=False, indent=2))
+            log_state_change(state, "delete_alert_state", chat_id=chat_id, symbol=symbol, tf=tf)
+            await persist_state(app, state)
 
 
 # =========================
@@ -1733,7 +1851,8 @@ async def restore_alerts(app: Application) -> None:
         alerts_all = copy.deepcopy(state.get("alerts", {}) or {})
         if changed:
             app.bot_data["state"] = state
-            save_state_json(json.dumps(state, ensure_ascii=False, indent=2))
+            log_state_change(state, "restore_alerts_prune")
+            await persist_state(app, state)
 
     for chat_id_str, amap in alerts_all.items():
         try:
@@ -1855,10 +1974,12 @@ async def send_scan_result(app: Application, chat_id: int, long_rows, short_rows
 
 async def run_monitor_once_internal(app: Application, chat_id: int):
     """Internal monitor function without timeout wrapper."""
+    start_ts = time.monotonic()
     session: aiohttp.ClientSession = app.bot_data["http_session"]
     rate_limiter: RateLimiter = app.bot_data["rate_limiter"]
     symbols = await get_cached_top_symbols(app)
     sem: asyncio.Semaphore = app.bot_data["http_sem"]
+    logging.debug("monitor_start chat_id=%s symbols=%d", chat_id, len(symbols))
 
     results: List[Tuple[str, float, Dict[str, float]]] = []
     queue: asyncio.Queue[str] = asyncio.Queue()
@@ -1918,6 +2039,16 @@ async def run_monitor_once_internal(app: Application, chat_id: int):
 
     # Calculate error rate
     error_rate = error_count / total_tasks if total_tasks > 0 else 0
+    duration = time.monotonic() - start_ts
+    logging.debug(
+        "monitor_done chat_id=%s symbols=%d success=%d errors=%d error_rate=%.3f duration=%.2fs",
+        chat_id,
+        total_tasks,
+        success_count,
+        error_count,
+        error_rate,
+        duration,
+    )
     
     # Notify user if error rate is high
     if error_rate > ERROR_RATE_THRESHOLD:
@@ -2002,6 +2133,14 @@ async def alert_job_callback(context: ContextTypes.DEFAULT_TYPE):
         return
 
     app = context.application
+    now = time.time()
+    notify_cache = app.bot_data.setdefault("alert_error_notify", {})
+    ttl_sec = ALERT_ERROR_NOTIFY_TTL_HOURS * 3600
+    last_prune = app.bot_data.get("alert_error_notify_last_prune", 0.0)
+    if ttl_sec > 0 and now - last_prune >= 600:
+        prune_ttl_dict(notify_cache, ttl_sec, now)
+        app.bot_data["alert_error_notify_last_prune"] = now
+
     key = f"{symbol}|{tf}"
     alerts_map = await get_alerts_for_chat(app, chat_id)
     entry = alerts_map.get(key)
@@ -2085,13 +2224,6 @@ async def alert_job_callback(context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         logging.exception("alert job failed for %s: %s", symbol, e)
         notify_key = (chat_id, symbol, tf)
-        notify_cache = app.bot_data.setdefault("alert_error_notify", {})
-        now = time.time()
-        ttl_sec = ALERT_ERROR_NOTIFY_TTL_HOURS * 3600
-        if ttl_sec > 0 and notify_cache:
-            for key, last_seen in list(notify_cache.items()):
-                if now - last_seen >= ttl_sec:
-                    del notify_cache[key]
         last_sent = notify_cache.get(notify_key, 0.0)
         throttle_sec = ALERT_ERROR_THROTTLE_MIN * 60
         if now - last_sent >= throttle_sec:
@@ -2103,6 +2235,35 @@ async def alert_job_callback(context: ContextTypes.DEFAULT_TYPE):
                 notify_cache[notify_key] = now
             except Exception:
                 logging.error("Failed to send alert error message to chat %s", chat_id)
+
+
+async def cleanup_job(context: ContextTypes.DEFAULT_TYPE) -> None:
+    app = context.application
+    now = time.time()
+
+    notify_cache = app.bot_data.setdefault("alert_error_notify", {})
+    prune_ttl_dict(notify_cache, ALERT_ERROR_NOTIFY_TTL_HOURS * 3600, now)
+
+    if ALERT_COOLDOWN_SEC > 0:
+        cooldowns = app.bot_data.setdefault("alert_cooldowns", {})
+        prune_ttl_dict(cooldowns, ALERT_COOLDOWN_SEC, now)
+
+    monitor_tasks: Set[asyncio.Task] = app.bot_data.get("monitor_tasks", set())
+    if monitor_tasks:
+        app.bot_data["monitor_tasks"] = {task for task in monitor_tasks if not task.done()}
+
+    state_lock: asyncio.Lock = app.bot_data["state_lock"]
+    async with state_lock:
+        state = app.bot_data.get("state") or {
+            "subs": {},
+            "alerts": {},
+            "pair_rsi_alerts": {},
+            "price_alerts": {},
+        }
+        changed = prune_expired_alerts(state, now=now)
+        if changed:
+            app.bot_data["state"] = state
+            await persist_state(app, state)
 
 
 async def price_alert_job_callback(context: ContextTypes.DEFAULT_TYPE):
@@ -2868,6 +3029,7 @@ async def post_init(app: Application):
     app.bot_data["http_session"] = aiohttp.ClientSession()
     app.bot_data["rate_limiter"] = RateLimiter()
     app.bot_data["state_lock"] = asyncio.Lock()
+    app.bot_data["state_write_lock"] = asyncio.Lock()
     app.bot_data["perp_symbols_lock"] = asyncio.Lock()
     app.bot_data["tickers_lock"] = asyncio.Lock()
     app.bot_data["http_sem"] = asyncio.Semaphore(MAX_CONCURRENCY)
@@ -2878,6 +3040,8 @@ async def post_init(app: Application):
     app.bot_data["perp_symbols_cache"] = None
     app.bot_data["tickers_cache"] = None
     app.bot_data["alert_cooldowns"] = {}
+    app.bot_data["alert_error_notify"] = {}
+    app.job_queue.run_repeating(cleanup_job, interval=CLEANUP_INTERVAL_SEC, first=CLEANUP_INTERVAL_SEC)
 
     # restore subscriptions with proper validation
     subs: dict = (app.bot_data["state"] or {}).get("subs", {})
@@ -2925,12 +3089,13 @@ async def post_shutdown(app: Application):
     sess: aiohttp.ClientSession = app.bot_data.get("http_session")
     if sess:
         await sess.close()
-    save_state(
-        app.bot_data.get(
+    state_lock: asyncio.Lock = app.bot_data["state_lock"]
+    async with state_lock:
+        state = app.bot_data.get(
             "state",
             {"subs": {}, "alerts": {}, "pair_rsi_alerts": {}, "price_alerts": {}},
         )
-    )
+        await persist_state(app, state)
 
 
 # =========================
