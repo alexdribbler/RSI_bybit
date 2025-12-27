@@ -338,13 +338,13 @@ def rsi_wilder(closes: List[float], period: int) -> Optional[float]:
 def is_long_candidate(rsis: Dict[str, float]) -> bool:
     if any(val > 50 for val in rsis.values()):
         return False
-    return not (rsis["5m"] > 35 and rsis["15m"] > 35)
+    return rsis["5m"] <= 35 and rsis["15m"] <= 35
 
 
 def is_short_candidate(rsis: Dict[str, float]) -> bool:
     if any(val < 70 for val in rsis.values()):
         return False
-    return not (rsis["5m"] < 80 and rsis["15m"] < 80)
+    return rsis["5m"] >= 80 and rsis["15m"] >= 80
 
 
 async def compute_symbol_rsi_sum(
