@@ -266,14 +266,42 @@ def save_state(state: dict) -> None:
 
 
 async def persist_state(app: Application, state: dict) -> None:
+    app.bot_data["state_save_pending"] = True
+    save_task: Optional[asyncio.Task] = app.bot_data.get("state_save_task")
+    if save_task is None or save_task.done():
+        app.bot_data["state_save_task"] = asyncio.create_task(state_save_worker(app))
+
+
+async def state_save_worker(app: Application) -> None:
     try:
-        state_json = json.dumps(state, ensure_ascii=False, indent=2)
-    except Exception as e:
-        logging.warning("Failed to serialize state: %s", e)
-        return
-    write_lock: asyncio.Lock = app.bot_data["state_write_lock"]
-    async with write_lock:
-        save_state_json(state_json)
+        while app.bot_data.get("state_save_pending"):
+            app.bot_data["state_save_pending"] = False
+            state_lock: asyncio.Lock = app.bot_data["state_lock"]
+            async with state_lock:
+                snapshot = copy.deepcopy(
+                    app.bot_data.get(
+                        "state",
+                        {"subs": {}, "alerts": {}, "pair_rsi_alerts": {}, "price_alerts": {}},
+                    )
+                )
+            try:
+                state_json = json.dumps(snapshot, ensure_ascii=False, indent=2)
+            except Exception as e:
+                logging.warning("Failed to serialize state: %s", e)
+                continue
+            write_lock: asyncio.Lock = app.bot_data["state_write_lock"]
+            async with write_lock:
+                save_state_json(state_json)
+    except asyncio.CancelledError:
+        raise
+
+
+async def flush_state(app: Application) -> None:
+    await persist_state(app, app.bot_data.get("state") or {})
+    save_task: Optional[asyncio.Task] = app.bot_data.get("state_save_task")
+    if save_task:
+        with contextlib.suppress(asyncio.TimeoutError, asyncio.CancelledError):
+            await asyncio.wait_for(save_task, timeout=SHUTDOWN_TASK_TIMEOUT)
 
 
 def log_state_change(state: dict, op: str, **fields: object) -> None:
@@ -965,7 +993,9 @@ def format_stoch_rsi_line(values: Dict[str, float]) -> str:
 
 def levered_pct(delta: float, price: float, lev: float) -> float:
     """Calculate leveraged percentage change."""
-    if price == 0:
+    if not math.isfinite(price) or price <= 0:
+        return 0.0
+    if abs(price) < 1e-12:
         return 0.0
     return (delta / price) * 100.0 * lev
 
@@ -2009,7 +2039,6 @@ async def run_monitor_once_internal(app: Application, chat_id: int):
                     local_error += 1
             except asyncio.CancelledError:
                 logging.warning("Task cancelled during monitor scan")
-                local_error += 1
                 raise
             except Exception as e:
                 logging.warning("Failed to compute RSI for %s: %s", symbol, e)
@@ -3030,6 +3059,8 @@ async def post_init(app: Application):
     app.bot_data["rate_limiter"] = RateLimiter()
     app.bot_data["state_lock"] = asyncio.Lock()
     app.bot_data["state_write_lock"] = asyncio.Lock()
+    app.bot_data["state_save_pending"] = False
+    app.bot_data["state_save_task"] = None
     app.bot_data["perp_symbols_lock"] = asyncio.Lock()
     app.bot_data["tickers_lock"] = asyncio.Lock()
     app.bot_data["http_sem"] = asyncio.Semaphore(MAX_CONCURRENCY)
@@ -3085,17 +3116,12 @@ async def post_shutdown(app: Application):
                 await asyncio.wait_for(gather_task, timeout=SHUTDOWN_TASK_TIMEOUT)
         except asyncio.TimeoutError:
             logging.warning("Monitor task shutdown timed out after %ss", SHUTDOWN_TASK_TIMEOUT)
+        monitor_tasks.clear()
 
     sess: aiohttp.ClientSession = app.bot_data.get("http_session")
     if sess:
         await sess.close()
-    state_lock: asyncio.Lock = app.bot_data["state_lock"]
-    async with state_lock:
-        state = app.bot_data.get(
-            "state",
-            {"subs": {}, "alerts": {}, "pair_rsi_alerts": {}, "price_alerts": {}},
-        )
-        await persist_state(app, state)
+    await flush_state(app)
 
 
 # =========================
