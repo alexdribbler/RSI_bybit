@@ -435,6 +435,11 @@ class RateLimiter:
                     self._success_streak = 0
                     logging.info("Rate limiter reset")
 
+    async def get_current_delay(self) -> float:
+        """Return the current delay used by the limiter."""
+        async with self._lock:
+            return self._delay
+
 
 async def api_get_json(
     session: aiohttp.ClientSession,
@@ -455,6 +460,14 @@ async def api_get_json(
                 params=params,
                 timeout=aiohttp.ClientTimeout(total=20),
             ) as resp:
+                if resp.status in {429, 503}:
+                    retry_after = resp.headers.get("Retry-After")
+                    await rate_limiter.report_rate_limit()
+                    if retry_after:
+                        try:
+                            await asyncio.sleep(float(retry_after))
+                        except (TypeError, ValueError):
+                            pass
                 data = await resp.json(content_type=None)
 
                 if not isinstance(data, dict):
@@ -1066,15 +1079,12 @@ async def set_sub(app: Application, chat_id: int, interval_min: int, enabled: bo
         return
     
     state_lock: asyncio.Lock = app.bot_data["state_lock"]
-    state_snapshot: Optional[str] = None
     async with state_lock:
         state = app.bot_data.get("state") or {"subs": {}, "alerts": {}}
         state.setdefault("subs", {})
         state["subs"][str(chat_id)] = {"interval_min": int(interval_min), "enabled": bool(enabled)}
         app.bot_data["state"] = state
-        state_snapshot = json.dumps(state, ensure_ascii=False, indent=2)
-    if state_snapshot:
-        save_state_json(state_snapshot)
+        save_state_json(json.dumps(state, ensure_ascii=False, indent=2))
 
 
 async def delete_sub(app: Application, chat_id: int) -> None:
@@ -1082,14 +1092,11 @@ async def delete_sub(app: Application, chat_id: int) -> None:
         return
     
     state_lock: asyncio.Lock = app.bot_data["state_lock"]
-    state_snapshot: Optional[str] = None
     async with state_lock:
         state = app.bot_data.get("state") or {"subs": {}, "alerts": {}}
         subs = state.setdefault("subs", {})
         subs.pop(str(chat_id), None)
-        state_snapshot = json.dumps(state, ensure_ascii=False, indent=2)
-    if state_snapshot:
-        save_state_json(state_snapshot)
+        save_state_json(json.dumps(state, ensure_ascii=False, indent=2))
 
 
 def normalize_tf_labels(selected_labels: Set[str]) -> List[Tuple[str, str]]:
@@ -1107,7 +1114,7 @@ async def get_pair_rsi_alerts_for_chat(app: Application, chat_id: int) -> Dict[s
     async with state_lock:
         state = app.bot_data.get("state") or {"subs": {}, "alerts": {}, "pair_rsi_alerts": {}}
         alerts = state.get("pair_rsi_alerts", {})
-        return alerts.get(str(chat_id), {})
+        return copy.deepcopy(alerts.get(str(chat_id), {}))
 
 
 async def set_pair_rsi_alert_state(
@@ -1141,7 +1148,6 @@ async def set_pair_rsi_alert_state(
     key = f"{symbol}|{','.join(ordered_intervals)}|{mode}"
 
     state_lock: asyncio.Lock = app.bot_data["state_lock"]
-    state_snapshot: Optional[str] = None
     async with state_lock:
         state = app.bot_data.get("state") or {"subs": {}, "alerts": {}, "pair_rsi_alerts": {}}
         alerts_all = state.setdefault("pair_rsi_alerts", {})
@@ -1161,9 +1167,7 @@ async def set_pair_rsi_alert_state(
             "created_at": time.time(),
         }
         app.bot_data["state"] = state
-        state_snapshot = json.dumps(state, ensure_ascii=False, indent=2)
-    if state_snapshot:
-        save_state_json(state_snapshot)
+        save_state_json(json.dumps(state, ensure_ascii=False, indent=2))
     return True, None
 
 
@@ -1171,16 +1175,13 @@ async def delete_pair_rsi_alert_state(app: Application, chat_id: int, key: str) 
     if not validate_chat_id(chat_id):
         return
     state_lock: asyncio.Lock = app.bot_data["state_lock"]
-    state_snapshot: Optional[str] = None
     async with state_lock:
         state = app.bot_data.get("state") or {"subs": {}, "alerts": {}, "pair_rsi_alerts": {}}
         alerts = state.setdefault("pair_rsi_alerts", {}).setdefault(str(chat_id), {})
         if key in alerts:
             alerts.pop(key, None)
             app.bot_data["state"] = state
-            state_snapshot = json.dumps(state, ensure_ascii=False, indent=2)
-    if state_snapshot:
-        save_state_json(state_snapshot)
+            save_state_json(json.dumps(state, ensure_ascii=False, indent=2))
 
 
 async def get_alerts_for_chat(app: Application, chat_id: int) -> Dict[str, dict]:
@@ -1191,7 +1192,7 @@ async def get_alerts_for_chat(app: Application, chat_id: int) -> Dict[str, dict]
     async with state_lock:
         state = app.bot_data.get("state") or {"subs": {}, "alerts": {}}
         alerts = state.get("alerts", {})
-        return alerts.get(str(chat_id), {})
+        return copy.deepcopy(alerts.get(str(chat_id), {}))
 
 
 def alert_ttl_seconds() -> float:
@@ -1264,7 +1265,6 @@ async def set_alert_state(
         return False, "Некорректный символ."
 
     state_lock: asyncio.Lock = app.bot_data["state_lock"]
-    state_snapshot: Optional[str] = None
     async with state_lock:
         state = app.bot_data.get("state") or {"subs": {}, "alerts": {}}
         now = time.time()
@@ -1289,10 +1289,8 @@ async def set_alert_state(
             "created_at": created_at,
         }
         app.bot_data["state"] = state
-        state_snapshot = json.dumps(state, ensure_ascii=False, indent=2)
-    if state_snapshot:
-        save_state_json(state_snapshot)
-        return True, None
+        save_state_json(json.dumps(state, ensure_ascii=False, indent=2))
+    return True, None
 
 
 async def update_alert_last_above(app: Application, chat_id: int, symbol: str, tf: str, last_above: bool) -> None:
@@ -1309,7 +1307,6 @@ async def update_alert_last_above(app: Application, chat_id: int, symbol: str, t
         return
     
     state_lock: asyncio.Lock = app.bot_data["state_lock"]
-    state_snapshot: Optional[str] = None
     async with state_lock:
         state = app.bot_data.get("state") or {"subs": {}, "alerts": {}}
         alerts = state.setdefault("alerts", {}).setdefault(str(chat_id), {})
@@ -1317,9 +1314,7 @@ async def update_alert_last_above(app: Application, chat_id: int, symbol: str, t
         if key in alerts:
             alerts[key]["last_above"] = bool(last_above)
             app.bot_data["state"] = state
-            state_snapshot = json.dumps(state, ensure_ascii=False, indent=2)
-    if state_snapshot:
-        save_state_json(state_snapshot)
+            save_state_json(json.dumps(state, ensure_ascii=False, indent=2))
 
 
 async def update_alert_created_at(app: Application, chat_id: int, symbol: str, tf: str, created_at: float) -> None:
@@ -1336,7 +1331,6 @@ async def update_alert_created_at(app: Application, chat_id: int, symbol: str, t
         return
 
     state_lock: asyncio.Lock = app.bot_data["state_lock"]
-    state_snapshot: Optional[str] = None
     async with state_lock:
         state = app.bot_data.get("state") or {"subs": {}, "alerts": {}}
         alerts = state.setdefault("alerts", {}).setdefault(str(chat_id), {})
@@ -1344,9 +1338,7 @@ async def update_alert_created_at(app: Application, chat_id: int, symbol: str, t
         if key in alerts:
             alerts[key]["created_at"] = float(created_at)
             app.bot_data["state"] = state
-            state_snapshot = json.dumps(state, ensure_ascii=False, indent=2)
-    if state_snapshot:
-        save_state_json(state_snapshot)
+            save_state_json(json.dumps(state, ensure_ascii=False, indent=2))
 
 
 async def delete_alert_state(
@@ -1367,7 +1359,6 @@ async def delete_alert_state(
             return
 
     state_lock: asyncio.Lock = app.bot_data["state_lock"]
-    state_snapshot: Optional[str] = None
     async with state_lock:
         state = app.bot_data.get("state") or {"subs": {}, "alerts": {}}
         alerts = state.setdefault("alerts", {}).setdefault(str(chat_id), {})
@@ -1375,9 +1366,7 @@ async def delete_alert_state(
         if key in alerts:
             alerts.pop(key, None)
             app.bot_data["state"] = state
-            state_snapshot = json.dumps(state, ensure_ascii=False, indent=2)
-    if state_snapshot:
-        save_state_json(state_snapshot)
+            save_state_json(json.dumps(state, ensure_ascii=False, indent=2))
 
 
 # =========================
@@ -1515,16 +1504,13 @@ def unschedule_pair_rsi_alerts(app: Application, chat_id: int) -> None:
 
 async def restore_alerts(app: Application) -> None:
     state_lock: asyncio.Lock = app.bot_data["state_lock"]
-    state_snapshot: Optional[str] = None
     async with state_lock:
         state = app.bot_data.get("state") or {"subs": {}, "alerts": {}}
         changed = prune_expired_alerts(state)
         alerts_all = copy.deepcopy(state.get("alerts", {}) or {})
         if changed:
             app.bot_data["state"] = state
-            state_snapshot = json.dumps(state, ensure_ascii=False, indent=2)
-    if state_snapshot:
-        save_state_json(state_snapshot)
+            save_state_json(json.dumps(state, ensure_ascii=False, indent=2))
 
     for chat_id_str, amap in alerts_all.items():
         try:
@@ -1707,12 +1693,16 @@ async def run_monitor_once(app: Application, chat_id: int):
     if current_task:
         monitor_tasks.add(current_task)
     try:
-        await asyncio.wait_for(run_monitor_once_internal(app, chat_id), timeout=MONITOR_TIMEOUT)
+        rate_limiter: RateLimiter = app.bot_data["rate_limiter"]
+        current_delay = await rate_limiter.get_current_delay()
+        delay_factor = max(1.0, current_delay / RATE_LIMIT_DELAY)
+        adaptive_timeout = int(MONITOR_TIMEOUT * delay_factor)
+        await asyncio.wait_for(run_monitor_once_internal(app, chat_id), timeout=adaptive_timeout)
     except asyncio.TimeoutError:
-        logging.error("Monitor timeout for chat_id=%s after %ds", chat_id, MONITOR_TIMEOUT)
+        logging.error("Monitor timeout for chat_id=%s after %ds", chat_id, adaptive_timeout)
         await app.bot.send_message(
             chat_id=chat_id,
-            text=f"⚠️ Превышено время ожидания ({MONITOR_TIMEOUT}с). Попробуйте позже."
+            text=f"⚠️ Превышено время ожидания ({adaptive_timeout}с). Попробуйте позже."
         )
     finally:
         if current_task:
@@ -2223,6 +2213,9 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # format: PAIR|L|BTCUSDT  or PAIR|S|BTCUSDT
         try:
             _, side, symbol = data.split("|", 2)
+            if side not in {"L", "S"}:
+                await app.bot.send_message(chat_id=chat_id, text="Некорректное направление.")
+                return
 
             valid_symbols = await get_valid_symbols_with_fallback(app)
             if not valid_symbols:
