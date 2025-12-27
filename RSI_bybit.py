@@ -96,7 +96,17 @@ RATE_LIMIT_MAX_DELAY = 60.0  # Maximum delay
 RATE_LIMIT_QUEUE_TIMEOUT = 300  # Maximum time to wait in queue (5 minutes)
 
 # Timeout for monitor scanning (seconds)
-DEFAULT_MONITOR_TIMEOUT = max(180, int(ceil(MAX_SYMBOLS / max(1, MAX_CONCURRENCY) * 10)))
+DEFAULT_MONITOR_TIMEOUT = max(
+    180,
+    int(
+        ceil(
+            MAX_SYMBOLS
+            / max(1, MAX_CONCURRENCY)
+            * len(TIMEFRAMES)
+            * RATE_LIMIT_MAX_DELAY
+        )
+    ),
+)
 MONITOR_TIMEOUT = int(os.getenv("MONITOR_TIMEOUT", str(DEFAULT_MONITOR_TIMEOUT)))
 
 # =========================
@@ -191,6 +201,21 @@ def get_alert_job_name(chat_id: int, symbol: str, tf: str) -> str:
 def validate_chat_id(chat_id: int) -> bool:
     """Validate chat_id to prevent injection attacks."""
     return isinstance(chat_id, int) and abs(chat_id) < 10**15
+
+
+async def get_valid_symbols_with_fallback(app: Application) -> Optional[Set[str]]:
+    """Return valid symbols set, refreshing cache if missing."""
+    perp_cache = app.bot_data.get("perp_symbols_cache")
+    if perp_cache and perp_cache.value:
+        return set(perp_cache.value)
+
+    try:
+        symbols = await get_cached_perp_symbols(app)
+    except Exception as e:
+        logging.warning("Failed to refresh perp symbols cache: %s", e)
+        return None
+
+    return set(symbols)
 
 
 def validate_symbol(symbol: str, valid_symbols: Optional[Set[str]] = None) -> bool:
@@ -794,11 +819,7 @@ async def set_alert_state(
         logging.warning("Invalid chat_id for alert: %s", chat_id)
         return
     
-    # Get valid symbols for validation
-    valid_symbols = None
-    perp_cache = app.bot_data.get("perp_symbols_cache")
-    if perp_cache:
-        valid_symbols = set(perp_cache.value)
+    valid_symbols = await get_valid_symbols_with_fallback(app)
     
     if not validate_symbol(symbol, valid_symbols):
         logging.warning("Invalid symbol for alert: %s", symbol)
@@ -839,10 +860,7 @@ async def delete_alert_state(app: Application, chat_id: int, symbol: str, tf: st
     if not validate_chat_id(chat_id):
         return
 
-    valid_symbols = None
-    perp_cache = app.bot_data.get("perp_symbols_cache")
-    if perp_cache:
-        valid_symbols = set(perp_cache.value)
+    valid_symbols = await get_valid_symbols_with_fallback(app)
 
     if not validate_symbol(symbol, valid_symbols):
         return
@@ -928,16 +946,23 @@ def unschedule_subscription(app: Application, chat_id: int) -> None:
         j.schedule_removal()
 
 
-def schedule_alert(app: Application, chat_id: int, symbol: str, tf: str, tf_label: str, side: str) -> None:
+def schedule_alert(
+    app: Application,
+    chat_id: int,
+    symbol: str,
+    tf: str,
+    tf_label: str,
+    side: str,
+    valid_symbols: Optional[Set[str]] = None,
+) -> None:
     if not validate_chat_id(chat_id):
         logging.warning("Invalid chat_id for alert: %s", chat_id)
         return
     
-    # Get valid symbols for validation
-    valid_symbols = None
-    perp_cache = app.bot_data.get("perp_symbols_cache")
-    if perp_cache:
-        valid_symbols = set(perp_cache.value)
+    if valid_symbols is None:
+        perp_cache = app.bot_data.get("perp_symbols_cache")
+        if perp_cache:
+            valid_symbols = set(perp_cache.value)
     
     if not validate_symbol(symbol, valid_symbols):
         logging.warning("Invalid symbol for alert: %s", symbol)
@@ -1157,10 +1182,7 @@ async def alert_job_callback(context: ContextTypes.DEFAULT_TYPE):
     
     # Validate symbol with whitelist
     app = context.application
-    valid_symbols = None
-    perp_cache = app.bot_data.get("perp_symbols_cache")
-    if perp_cache:
-        valid_symbols = set(perp_cache.value)
+    valid_symbols = await get_valid_symbols_with_fallback(app)
     
     if not validate_symbol(symbol, valid_symbols):
         logging.warning("Invalid symbol for alert: %s", symbol)
@@ -1379,13 +1401,9 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # format: PAIR|L|BTCUSDT  or PAIR|S|BTCUSDT
         try:
             _, side, symbol = data.split("|", 2)
-            
-            # Get valid symbols for validation
-            valid_symbols = None
-            perp_cache = app.bot_data.get("perp_symbols_cache")
-            if perp_cache:
-                valid_symbols = set(perp_cache.value)
-            
+
+            valid_symbols = await get_valid_symbols_with_fallback(app)
+
             if not validate_symbol(symbol, valid_symbols):
                 await app.bot.send_message(chat_id=chat_id, text="Некорректный символ.")
                 return
@@ -1474,12 +1492,8 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await app.bot.send_message(chat_id=chat_id, text="Некорректный таймфрейм.")
                 return
             
-            # Get valid symbols for validation
-            valid_symbols = None
-            perp_cache = app.bot_data.get("perp_symbols_cache")
-            if perp_cache:
-                valid_symbols = set(perp_cache.value)
-            
+            valid_symbols = await get_valid_symbols_with_fallback(app)
+
             if not validate_symbol(symbol, valid_symbols):
                 await app.bot.send_message(chat_id=chat_id, text="Некорректный символ.")
                 return
@@ -1493,7 +1507,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         # Save alert with last_above = None (first check will set)
         await set_alert_state(app, chat_id, symbol, tf, tf_label, side, last_above=None)
-        schedule_alert(app, chat_id, symbol, tf, tf_label, side)
+        schedule_alert(app, chat_id, symbol, tf, tf_label, side, valid_symbols)
 
         await app.bot.send_message(
             chat_id=chat_id,
