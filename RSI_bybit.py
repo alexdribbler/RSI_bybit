@@ -57,8 +57,9 @@ ALERT_TFS: List[Tuple[str, str]] = [
 ]
 
 ALERT_CHECK_SEC = int(os.getenv("ALERT_CHECK_SEC", "300"))  # check every 5 minutes by default
-ALERT_THRESHOLD = float(os.getenv("ALERT_THRESHOLD", "50"))
-ALERT_EPS = float(os.getenv("ALERT_EPS", "0.10"))  # "equals 50" tolerance
+ALERT_EPS = float(os.getenv("ALERT_EPS", "0.10"))  # "equals threshold" tolerance
+ALERT_LONG_THRESHOLD = float(os.getenv("ALERT_LONG_THRESHOLD", "40"))
+ALERT_SHORT_THRESHOLD = float(os.getenv("ALERT_SHORT_THRESHOLD", "60"))
 
 MAX_SYMBOLS = int(os.getenv("MAX_SYMBOLS", "200"))
 MAX_CONCURRENCY = int(os.getenv("MAX_CONCURRENCY", "20"))  # Increased from 10 for better performance
@@ -105,7 +106,13 @@ logging.basicConfig(
 #   "subs": { "<chat_id>": { "interval_min": 15, "enabled": true } },
 #   "alerts": {
 #       "<chat_id>": {
-#           "BTCUSDT|15": { "symbol":"BTCUSDT","tf":"15","tf_label":"15m","last_above": true/false/null }
+#           "BTCUSDT|15": {
+#               "symbol":"BTCUSDT",
+#               "tf":"15",
+#               "tf_label":"15m",
+#               "side":"L",
+#               "last_above": true/false/null
+#           }
 #       }
 #   }
 # }
@@ -633,13 +640,13 @@ def interval_picker_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(rows)
 
 
-def alerts_kb(symbol: str) -> InlineKeyboardMarkup:
+def alerts_kb(symbol: str, side: str) -> InlineKeyboardMarkup:
     # 3 кнопки, как просили
     return InlineKeyboardMarkup(
         [[
-            InlineKeyboardButton("Alert 5m", callback_data=f"ALERT|5|{symbol}"),
-            InlineKeyboardButton("Alert 15m", callback_data=f"ALERT|15|{symbol}"),
-            InlineKeyboardButton("Alert 30m", callback_data=f"ALERT|30|{symbol}"),
+            InlineKeyboardButton("Alert 5m", callback_data=f"ALERT|5|{side}|{symbol}"),
+            InlineKeyboardButton("Alert 15m", callback_data=f"ALERT|15|{side}|{symbol}"),
+            InlineKeyboardButton("Alert 30m", callback_data=f"ALERT|30|{side}|{symbol}"),
         ]]
     )
 
@@ -723,6 +730,7 @@ async def set_alert_state(
     symbol: str,
     tf: str,
     tf_label: str,
+    side: str,
     last_above: Optional[bool] = None,
 ) -> None:
     if not validate_chat_id(chat_id):
@@ -748,6 +756,7 @@ async def set_alert_state(
             "symbol": symbol,
             "tf": tf,
             "tf_label": tf_label,
+            "side": side,
             "last_above": last_above,  # can be None
         }
         app.bot_data["state"] = state
@@ -848,7 +857,7 @@ def unschedule_subscription(app: Application, chat_id: int) -> None:
         j.schedule_removal()
 
 
-def schedule_alert(app: Application, chat_id: int, symbol: str, tf: str, tf_label: str) -> None:
+def schedule_alert(app: Application, chat_id: int, symbol: str, tf: str, tf_label: str, side: str) -> None:
     if not validate_chat_id(chat_id):
         logging.warning("Invalid chat_id for alert: %s", chat_id)
         return
@@ -875,7 +884,7 @@ def schedule_alert(app: Application, chat_id: int, symbol: str, tf: str, tf_labe
         first=2,
         chat_id=chat_id,
         name=name,
-        data={"symbol": symbol, "tf": tf, "tf_label": tf_label},
+        data={"symbol": symbol, "tf": tf, "tf_label": tf_label, "side": side},
     )
 
 
@@ -903,8 +912,9 @@ def restore_alerts(app: Application) -> None:
                 symbol = a.get("symbol")
                 tf = a.get("tf")
                 tf_label = a.get("tf_label") or f"{tf}m"
-                if symbol and tf:
-                    schedule_alert(app, chat_id, symbol, tf, tf_label)
+                side = a.get("side")
+                if symbol and tf and side:
+                    schedule_alert(app, chat_id, symbol, tf, tf_label, side)
             except Exception as e:
                 logging.warning("Failed restoring alert: %s", e)
 
@@ -1046,8 +1056,11 @@ async def alert_job_callback(context: ContextTypes.DEFAULT_TYPE):
     symbol = data.get("symbol")
     tf = data.get("tf")
     tf_label = data.get("tf_label") or f"{tf}m"
+    side = data.get("side")
     
-    if not symbol or not tf:
+    if not symbol or not tf or not side:
+        return
+    if side not in {"L", "S"}:
         return
     
     if not validate_chat_id(chat_id):
@@ -1078,34 +1091,48 @@ async def alert_job_callback(context: ContextTypes.DEFAULT_TYPE):
         key = f"{symbol}|{tf}"
         prev = alerts_map.get(key, {}).get("last_above", None)
 
-        now_above = bool(rsi >= ALERT_THRESHOLD)
-        near = abs(rsi - ALERT_THRESHOLD) <= ALERT_EPS
+        if side == "L":
+            threshold = ALERT_LONG_THRESHOLD
+            condition_met = bool(rsi >= threshold)
+            direction_label = "LONG"
+            trigger_label = f">= {threshold:.0f}"
+        else:
+            threshold = ALERT_SHORT_THRESHOLD
+            condition_met = bool(rsi <= threshold)
+            direction_label = "SHORT"
+            trigger_label = f"<= {threshold:.0f}"
 
-        # First run: do not spam, but if "near 50" - alert once.
+        near = abs(rsi - threshold) <= ALERT_EPS
+
+        # First run: do not spam, but if near threshold - alert once.
         if prev is None:
-            await update_alert_last_above(app, chat_id, symbol, tf, now_above)
+            await update_alert_last_above(app, chat_id, symbol, tf, condition_met)
             if near:
                 await app.bot.send_message(
                     chat_id=chat_id,
-                    text=f"🔔 ALERT {symbol} RSI{RSI_PERIOD}({tf_label}) ≈ {ALERT_THRESHOLD}\nCurrent RSI: {rsi:.2f}",
+                    text=(
+                        f"🔔 ALERT {symbol} {direction_label} RSI{RSI_PERIOD}({tf_label}) ≈ {threshold:.0f}\n"
+                        f"Current RSI: {rsi:.2f}"
+                    ),
                 )
                 unschedule_alert(app, chat_id, symbol, tf)
                 await delete_alert_state(app, chat_id, symbol, tf)
             return
 
-        # Crossing detection or exact hit
-        crossed = (prev != now_above)
-        if crossed or near:
-            direction = "↑ crossed above" if now_above else "↓ crossed below"
-            extra = f"{direction} {ALERT_THRESHOLD}" if crossed else f"hit ≈ {ALERT_THRESHOLD}"
+        triggered = (not prev) and condition_met
+        if triggered or near:
+            extra = f"hit {trigger_label}" if triggered else f"hit ≈ {threshold:.0f}"
             await app.bot.send_message(
                 chat_id=chat_id,
-                text=f"🔔 ALERT {symbol} RSI{RSI_PERIOD}({tf_label}) {extra}\nCurrent RSI: {rsi:.2f}",
+                text=(
+                    f"🔔 ALERT {symbol} {direction_label} RSI{RSI_PERIOD}({tf_label}) {extra}\n"
+                    f"Current RSI: {rsi:.2f}"
+                ),
             )
             unschedule_alert(app, chat_id, symbol, tf)
             await delete_alert_state(app, chat_id, symbol, tf)
 
-        await update_alert_last_above(app, chat_id, symbol, tf, now_above)
+        await update_alert_last_above(app, chat_id, symbol, tf, condition_met)
 
     except Exception as e:
         logging.exception("alert job failed for %s: %s", symbol, e)
@@ -1334,7 +1361,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 chat_id=chat_id,
                 text=msg,
                 parse_mode="HTML",
-                reply_markup=alerts_kb(symbol),
+                reply_markup=alerts_kb(symbol, side),
             )
 
         except Exception as e:
@@ -1345,9 +1372,16 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # Alert button from calc message
     if data.startswith("ALERT|"):
-        # format: ALERT|15|BTCUSDT
+        # format: ALERT|15|L|BTCUSDT
         try:
-            _, tf, symbol = data.split("|", 2)
+            parts = data.split("|")
+            if len(parts) != 4:
+                await app.bot.send_message(chat_id=chat_id, text="Не удалось определить направление. Выберите пару заново.")
+                return
+            _, tf, side, symbol = parts
+            if side not in {"L", "S"}:
+                await app.bot.send_message(chat_id=chat_id, text="Некорректное направление. Выберите пару заново.")
+                return
             
             # Get valid symbols for validation
             valid_symbols = None
@@ -1362,14 +1396,20 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         tf_label = next((lbl for (lbl, iv) in ALERT_TFS if iv == tf), f"{tf}m")
+        direction_label = "LONG" if side == "L" else "SHORT"
+        threshold = ALERT_LONG_THRESHOLD if side == "L" else ALERT_SHORT_THRESHOLD
+        trigger_label = f">= {threshold:.0f}" if side == "L" else f"<= {threshold:.0f}"
 
         # Save alert with last_above = None (first check will set)
-        await set_alert_state(app, chat_id, symbol, tf, tf_label, last_above=None)
-        schedule_alert(app, chat_id, symbol, tf, tf_label)
+        await set_alert_state(app, chat_id, symbol, tf, tf_label, side, last_above=None)
+        schedule_alert(app, chat_id, symbol, tf, tf_label, side)
 
         await app.bot.send_message(
             chat_id=chat_id,
-            text=f"✅ Alert включён: {symbol} RSI{RSI_PERIOD}({tf_label}) → {ALERT_THRESHOLD} (проверка каждые {ALERT_CHECK_SEC//60} мин)",
+            text=(
+                f"✅ Alert включён: {symbol} {direction_label} RSI{RSI_PERIOD}({tf_label}) {trigger_label} "
+                f"(проверка каждые {ALERT_CHECK_SEC//60} мин)"
+            ),
         )
         return
 
