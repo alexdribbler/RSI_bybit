@@ -61,7 +61,7 @@ ALERT_THRESHOLD = float(os.getenv("ALERT_THRESHOLD", "50"))
 ALERT_EPS = float(os.getenv("ALERT_EPS", "0.10"))  # "equals 50" tolerance
 
 MAX_SYMBOLS = int(os.getenv("MAX_SYMBOLS", "200"))
-MAX_CONCURRENCY = int(os.getenv("MAX_CONCURRENCY", "10"))
+MAX_CONCURRENCY = int(os.getenv("MAX_CONCURRENCY", "20"))  # Increased from 10 for better performance
 KLINE_LIMIT = int(os.getenv("KLINE_LIMIT", "120"))
 
 TICKERS_CACHE_TTL = int(os.getenv("TICKERS_CACHE_TTL", "60"))
@@ -74,6 +74,10 @@ IMAGE_PADDING = int(os.getenv("IMAGE_PADDING", "26"))
 LINE_SPACING = int(os.getenv("LINE_SPACING", "6"))
 
 STATE_FILE = os.getenv("STATE_FILE", "bot_state.json")
+
+# Subscription interval limits
+MIN_INTERVAL_MINUTES = 1
+MAX_INTERVAL_MINUTES = 1440
 
 # =========================
 # LOGGING
@@ -120,6 +124,24 @@ def get_sub_job_name(chat_id: int) -> str:
 
 def get_alert_job_name(chat_id: int, symbol: str, tf: str) -> str:
     return f"rsi_alert:{chat_id}:{symbol}:{tf}"
+
+
+# =========================
+# INPUT VALIDATION
+# =========================
+def validate_chat_id(chat_id: int) -> bool:
+    """Validate chat_id to prevent injection attacks."""
+    return isinstance(chat_id, int) and abs(chat_id) < 10**15
+
+
+def validate_symbol(symbol: str) -> bool:
+    """Validate symbol to prevent injection attacks."""
+    return isinstance(symbol, str) and symbol.isalnum() and len(symbol) <= 20
+
+
+def validate_interval(interval_min: int) -> bool:
+    """Validate subscription interval."""
+    return MIN_INTERVAL_MINUTES <= interval_min <= MAX_INTERVAL_MINUTES
 
 
 # =========================
@@ -269,7 +291,7 @@ async def get_kline_rows(
     }
     payload = await api_get_json(session, url, params)
     rows = ((payload.get("result") or {}).get("list")) or []
-    # newest first
+    # API returns newest first
     return rows
 
 
@@ -284,6 +306,7 @@ async def get_kline_closes(session: aiohttp.ClientSession, symbol: str, interval
             closes.append(float(c[4]))
         except Exception:
             continue
+    # Reverse to get oldest first for RSI calculation
     closes.reverse()
     return closes
 
@@ -329,7 +352,8 @@ async def compute_symbol_rsi_sum(
 
     try:
         await asyncio.gather(*(one_tf(lbl, iv) for (lbl, iv) in TIMEFRAMES))
-    except Exception:
+    except Exception as e:
+        logging.debug("Failed to compute RSI for %s: %s", symbol, e)
         return None
 
     s = sum(rsis[lbl] for (lbl, _) in TIMEFRAMES)
@@ -532,11 +556,17 @@ def pairs_keyboard(long_syms: List[str], short_syms: List[str]) -> InlineKeyboar
 # BOT STATE HELPERS
 # =========================
 def get_sub(app: Application, chat_id: int) -> Optional[dict]:
+    if not validate_chat_id(chat_id):
+        return None
     subs = (app.bot_data.get("state") or {}).get("subs", {})
     return subs.get(str(chat_id))
 
 
 def set_sub(app: Application, chat_id: int, interval_min: int, enabled: bool = True) -> None:
+    if not validate_chat_id(chat_id) or not validate_interval(interval_min):
+        logging.warning("Invalid chat_id or interval: %s, %s", chat_id, interval_min)
+        return
+    
     state = app.bot_data.get("state") or {"subs": {}, "alerts": {}}
     state.setdefault("subs", {})
     state["subs"][str(chat_id)] = {"interval_min": int(interval_min), "enabled": bool(enabled)}
@@ -545,6 +575,8 @@ def set_sub(app: Application, chat_id: int, interval_min: int, enabled: bool = T
 
 
 def delete_sub(app: Application, chat_id: int) -> None:
+    if not validate_chat_id(chat_id):
+        return
     state = app.bot_data.get("state") or {"subs": {}, "alerts": {}}
     subs = state.get("subs", {})
     subs.pop(str(chat_id), None)
@@ -552,6 +584,8 @@ def delete_sub(app: Application, chat_id: int) -> None:
 
 
 def get_alerts_for_chat(app: Application, chat_id: int) -> Dict[str, dict]:
+    if not validate_chat_id(chat_id):
+        return {}
     state = app.bot_data.get("state") or {"subs": {}, "alerts": {}}
     alerts = state.setdefault("alerts", {})
     return alerts.setdefault(str(chat_id), {})
@@ -565,6 +599,10 @@ def set_alert_state(
     tf_label: str,
     last_above: Optional[bool] = None,
 ) -> None:
+    if not validate_chat_id(chat_id) or not validate_symbol(symbol):
+        logging.warning("Invalid chat_id or symbol for alert: %s, %s", chat_id, symbol)
+        return
+    
     state = app.bot_data.get("state") or {"subs": {}, "alerts": {}}
     alerts = state.setdefault("alerts", {}).setdefault(str(chat_id), {})
     key = f"{symbol}|{tf}"
@@ -579,6 +617,8 @@ def set_alert_state(
 
 
 def update_alert_last_above(app: Application, chat_id: int, symbol: str, tf: str, last_above: bool) -> None:
+    if not validate_chat_id(chat_id):
+        return
     state = app.bot_data.get("state") or {"subs": {}, "alerts": {}}
     alerts = state.setdefault("alerts", {}).setdefault(str(chat_id), {})
     key = f"{symbol}|{tf}"
@@ -620,6 +660,10 @@ async def get_cached_top_symbols(app: Application) -> List[str]:
 # SCHEDULING
 # =========================
 def schedule_subscription(app: Application, chat_id: int, interval_min: int) -> None:
+    if not validate_chat_id(chat_id) or not validate_interval(interval_min):
+        logging.warning("Invalid parameters for scheduling: chat_id=%s, interval=%s", chat_id, interval_min)
+        return
+    
     jobs = app.job_queue.get_jobs_by_name(get_sub_job_name(chat_id))
     for j in jobs:
         j.schedule_removal()
@@ -639,6 +683,10 @@ def unschedule_subscription(app: Application, chat_id: int) -> None:
 
 
 def schedule_alert(app: Application, chat_id: int, symbol: str, tf: str, tf_label: str) -> None:
+    if not validate_chat_id(chat_id) or not validate_symbol(symbol):
+        logging.warning("Invalid parameters for alert: chat_id=%s, symbol=%s", chat_id, symbol)
+        return
+    
     # dedupe by job name
     name = get_alert_job_name(chat_id, symbol, tf)
     jobs = app.job_queue.get_jobs_by_name(name)
@@ -661,6 +709,8 @@ def restore_alerts(app: Application) -> None:
     for chat_id_str, amap in alerts_all.items():
         try:
             chat_id = int(chat_id_str)
+            if not validate_chat_id(chat_id):
+                continue
         except Exception:
             continue
         if not isinstance(amap, dict):
@@ -670,7 +720,7 @@ def restore_alerts(app: Application) -> None:
                 symbol = a.get("symbol")
                 tf = a.get("tf")
                 tf_label = a.get("tf_label") or f"{tf}m"
-                if symbol and tf:
+                if symbol and tf and validate_symbol(symbol):
                     schedule_alert(app, chat_id, symbol, tf, tf_label)
             except Exception as e:
                 logging.warning("Failed restoring alert: %s", e)
@@ -714,10 +764,15 @@ async def run_monitor_once(app: Application, chat_id: int):
     results: List[Tuple[str, float, Dict[str, float]]] = []
     tasks = [compute_symbol_rsi_sum(session, sem, s) for s in symbols]
 
+    # Improved error handling for async tasks
     for coro in asyncio.as_completed(tasks):
-        r = await coro
-        if r is not None:
-            results.append(r)
+        try:
+            r = await coro
+            if r is not None:
+                results.append(r)
+        except Exception as e:
+            logging.warning("Failed to compute RSI for a symbol: %s", e)
+            continue
 
     if not results:
         await app.bot.send_message(chat_id=chat_id, text="Не получилось собрать RSI (rate limit/временная ошибка).")
@@ -739,7 +794,10 @@ async def sub_job_callback(context: ContextTypes.DEFAULT_TYPE):
         await run_monitor_once(context.application, chat_id)
     except Exception as e:
         logging.exception("subscription job failed: %s", e)
-        await context.application.bot.send_message(chat_id=chat_id, text=f"Ошибка мониторинга: {e}")
+        try:
+            await context.application.bot.send_message(chat_id=chat_id, text=f"Ошибка мониторинга: {e}")
+        except Exception:
+            logging.error("Failed to send error message to chat %s", chat_id)
 
 
 async def alert_job_callback(context: ContextTypes.DEFAULT_TYPE):
@@ -748,7 +806,12 @@ async def alert_job_callback(context: ContextTypes.DEFAULT_TYPE):
     symbol = data.get("symbol")
     tf = data.get("tf")
     tf_label = data.get("tf_label") or f"{tf}m"
+    
     if not symbol or not tf:
+        return
+    
+    if not validate_chat_id(chat_id) or not validate_symbol(symbol):
+        logging.warning("Invalid alert parameters: chat_id=%s, symbol=%s", chat_id, symbol)
         return
 
     app = context.application
@@ -790,7 +853,7 @@ async def alert_job_callback(context: ContextTypes.DEFAULT_TYPE):
         update_alert_last_above(app, chat_id, symbol, tf, now_above)
 
     except Exception as e:
-        logging.exception("alert job failed: %s", e)
+        logging.exception("alert job failed for %s: %s", symbol, e)
         # keep it quiet; optionally notify user:
         # await app.bot.send_message(chat_id=chat_id, text=f"Alert error {symbol}({tf_label}): {e}")
 
@@ -826,6 +889,13 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("Нужно число минут, например 15. Или выбери кнопкой ниже.", reply_markup=interval_picker_kb())
             return
 
+        if not validate_interval(minutes):
+            await update.message.reply_text(
+                f"Интервал должен быть от {MIN_INTERVAL_MINUTES} до {MAX_INTERVAL_MINUTES} минут.",
+                reply_markup=interval_picker_kb()
+            )
+            return
+
         await apply_interval(app, chat_id, minutes)
         context.user_data["await_interval"] = False
         return
@@ -836,8 +906,11 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def apply_interval(app: Application, chat_id: int, minutes: int):
-    if minutes < 1 or minutes > 1440:
-        await app.bot.send_message(chat_id=chat_id, text="Интервал должен быть от 1 до 1440 минут.")
+    if not validate_interval(minutes):
+        await app.bot.send_message(
+            chat_id=chat_id,
+            text=f"Интервал должен быть от {MIN_INTERVAL_MINUTES} до {MAX_INTERVAL_MINUTES} минут."
+        )
         return
 
     set_sub(app, chat_id, minutes, enabled=True)
@@ -845,7 +918,12 @@ async def apply_interval(app: Application, chat_id: int, minutes: int):
 
     await app.bot.send_message(chat_id=chat_id, text=f"✅ Подписка создана/обновлена: каждые {minutes} минут.")
     await app.bot.send_message(chat_id=chat_id, text="Первый прогон — собираю данные…")
-    await run_monitor_once(app, chat_id)
+    
+    try:
+        await run_monitor_once(app, chat_id)
+    except Exception as e:
+        logging.exception("Failed to run initial monitor: %s", e)
+        await app.bot.send_message(chat_id=chat_id, text=f"Ошибка при первом запуске: {e}")
 
 
 async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -880,6 +958,14 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception:
             await app.bot.send_message(chat_id=chat_id, text="Ошибка интервала. Попробуйте ещё раз.")
             return
+        
+        if not validate_interval(minutes):
+            await app.bot.send_message(
+                chat_id=chat_id,
+                text=f"Интервал должен быть от {MIN_INTERVAL_MINUTES} до {MAX_INTERVAL_MINUTES} минут."
+            )
+            return
+        
         await apply_interval(app, chat_id, minutes)
         return
 
@@ -918,6 +1004,9 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # format: PAIR|L|BTCUSDT  or PAIR|S|BTCUSDT
         try:
             _, side, symbol = data.split("|", 2)
+            if not validate_symbol(symbol):
+                await app.bot.send_message(chat_id=chat_id, text="Некорректный символ.")
+                return
         except Exception:
             return
 
@@ -986,6 +1075,9 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # format: ALERT|15|BTCUSDT
         try:
             _, tf, symbol = data.split("|", 2)
+            if not validate_symbol(symbol):
+                await app.bot.send_message(chat_id=chat_id, text="Некорректный символ.")
+                return
         except Exception:
             return
 
@@ -1014,7 +1106,7 @@ async def post_init(app: Application):
     app.bot_data["perp_symbols_cache"] = None
     app.bot_data["tickers_cache"] = None
 
-    # restore subscriptions
+    # restore subscriptions with proper validation
     subs: dict = (app.bot_data["state"] or {}).get("subs", {})
     for chat_id_str, sub in subs.items():
         try:
@@ -1022,9 +1114,14 @@ async def post_init(app: Application):
                 continue
             interval_min = int(sub.get("interval_min", 0))
             chat_id = int(chat_id_str)
-            if interval_min >= 1:
-                schedule_subscription(app, chat_id, interval_min)
-                logging.info("Restored subscription chat_id=%s interval=%s", chat_id, interval_min)
+            
+            # Validate both chat_id and interval
+            if not validate_chat_id(chat_id) or not validate_interval(interval_min):
+                logging.warning("Skipping invalid subscription: chat_id=%s, interval=%s", chat_id, interval_min)
+                continue
+            
+            schedule_subscription(app, chat_id, interval_min)
+            logging.info("Restored subscription chat_id=%s interval=%s", chat_id, interval_min)
         except Exception as e:
             logging.warning("Failed to restore sub %s: %s", chat_id_str, e)
 
