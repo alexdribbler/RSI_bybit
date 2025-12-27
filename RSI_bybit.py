@@ -46,28 +46,31 @@ RSI_PERIOD = 6
 STOCH_RSI_PERIOD = int(os.getenv("STOCH_RSI_PERIOD", "14"))
 LEVERAGE = float(os.getenv("LEVERAGE", "20"))
 
+# Unified timeframe registry (label -> interval in minutes)
+TIMEFRAME_REGISTRY: Dict[str, str] = {
+    "5m": "5",
+    "15m": "15",
+    "30m": "30",
+    "1h": "60",
+    "2h": "120",
+    "4h": "240",
+}
+
 # RSI timeframes for SUM (now includes 5m)
-TIMEFRAMES: List[Tuple[str, str]] = [
-    ("5m", "5"),
-    ("15m", "15"),
-    ("30m", "30"),
-    ("1h", "60"),
-    ("2h", "120"),
-    ("4h", "240"),
-]
+TIMEFRAMES: List[Tuple[str, str]] = [(label, interval) for label, interval in TIMEFRAME_REGISTRY.items()]
 
 # Alert options (fixed to 5m/15m/30m)
 ALERT_TFS: List[Tuple[str, str]] = [
-    ("5m", "5"),
-    ("15m", "15"),
-    ("30m", "30"),
+    (label, interval)
+    for label, interval in TIMEFRAME_REGISTRY.items()
+    if label in {"5m", "15m", "30m"}
 ]
 ALERT_INTERVALS = {iv for _, iv in ALERT_TFS}
 
 STOCH_RSI_TFS: List[Tuple[str, str]] = [
-    ("5m", "5"),
-    ("15m", "15"),
-    ("30m", "30"),
+    (label, interval)
+    for label, interval in TIMEFRAME_REGISTRY.items()
+    if label in {"5m", "15m", "30m"}
 ]
 
 ALERT_CHECK_SEC = int(os.getenv("ALERT_CHECK_SEC", "300"))  # check every 5 minutes by default
@@ -214,11 +217,11 @@ def load_state() -> dict:
     return {"subs": {}, "alerts": {}}
 
 
-def save_state(state: dict) -> None:
+def save_state_json(state_json: str) -> None:
     try:
         tmp = STATE_FILE + ".tmp"
         with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(state, f, ensure_ascii=False, indent=2)
+            f.write(state_json)
         os.replace(tmp, STATE_FILE)
     except OSError as e:
         if e.errno == 28:
@@ -230,6 +233,15 @@ def save_state(state: dict) -> None:
         logging.warning("Failed to save state: %s", e)
     except Exception as e:
         logging.warning("Failed to save state: %s", e)
+
+
+def save_state(state: dict) -> None:
+    try:
+        state_json = json.dumps(state, ensure_ascii=False, indent=2)
+    except Exception as e:
+        logging.warning("Failed to serialize state: %s", e)
+        return
+    save_state_json(state_json)
 
 
 def validate_state(state: object) -> bool:
@@ -933,12 +945,15 @@ async def set_sub(app: Application, chat_id: int, interval_min: int, enabled: bo
         return
     
     state_lock: asyncio.Lock = app.bot_data["state_lock"]
+    state_snapshot: Optional[str] = None
     async with state_lock:
         state = app.bot_data.get("state") or {"subs": {}, "alerts": {}}
         state.setdefault("subs", {})
         state["subs"][str(chat_id)] = {"interval_min": int(interval_min), "enabled": bool(enabled)}
         app.bot_data["state"] = state
-        save_state(copy.deepcopy(state))
+        state_snapshot = json.dumps(state, ensure_ascii=False, indent=2)
+    if state_snapshot:
+        save_state_json(state_snapshot)
 
 
 async def delete_sub(app: Application, chat_id: int) -> None:
@@ -946,11 +961,14 @@ async def delete_sub(app: Application, chat_id: int) -> None:
         return
     
     state_lock: asyncio.Lock = app.bot_data["state_lock"]
+    state_snapshot: Optional[str] = None
     async with state_lock:
         state = app.bot_data.get("state") or {"subs": {}, "alerts": {}}
         subs = state.setdefault("subs", {})
         subs.pop(str(chat_id), None)
-        save_state(copy.deepcopy(state))
+        state_snapshot = json.dumps(state, ensure_ascii=False, indent=2)
+    if state_snapshot:
+        save_state_json(state_snapshot)
 
 
 async def get_alerts_for_chat(app: Application, chat_id: int) -> Dict[str, dict]:
@@ -971,7 +989,11 @@ def alert_ttl_seconds() -> float:
 def is_alert_expired(created_at: float, now: Optional[float] = None) -> bool:
     if now is None:
         now = time.time()
-    return (now - float(created_at)) >= alert_ttl_seconds()
+    try:
+        created_at_ts = float(created_at)
+    except (TypeError, ValueError):
+        return True
+    return (now - created_at_ts) >= alert_ttl_seconds()
 
 
 def prune_expired_alerts(state: dict, now: Optional[float] = None) -> bool:
@@ -1027,6 +1049,7 @@ async def set_alert_state(
         return False, "Некорректный символ."
 
     state_lock: asyncio.Lock = app.bot_data["state_lock"]
+    state_snapshot: Optional[str] = None
     async with state_lock:
         state = app.bot_data.get("state") or {"subs": {}, "alerts": {}}
         now = time.time()
@@ -1051,15 +1074,25 @@ async def set_alert_state(
             "created_at": created_at,
         }
         app.bot_data["state"] = state
-        save_state(copy.deepcopy(state))
+        state_snapshot = json.dumps(state, ensure_ascii=False, indent=2)
+    if state_snapshot:
+        save_state_json(state_snapshot)
         return True, None
 
 
 async def update_alert_last_above(app: Application, chat_id: int, symbol: str, tf: str, last_above: bool) -> None:
     if not validate_chat_id(chat_id):
         return
+
+    if tf not in ALERT_INTERVALS:
+        return
+
+    valid_symbols = await get_valid_symbols_with_fallback(app)
+    if not validate_symbol(symbol, valid_symbols):
+        return
     
     state_lock: asyncio.Lock = app.bot_data["state_lock"]
+    state_snapshot: Optional[str] = None
     async with state_lock:
         state = app.bot_data.get("state") or {"subs": {}, "alerts": {}}
         alerts = state.setdefault("alerts", {}).setdefault(str(chat_id), {})
@@ -1067,14 +1100,24 @@ async def update_alert_last_above(app: Application, chat_id: int, symbol: str, t
         if key in alerts:
             alerts[key]["last_above"] = bool(last_above)
             app.bot_data["state"] = state
-            save_state(copy.deepcopy(state))
+            state_snapshot = json.dumps(state, ensure_ascii=False, indent=2)
+    if state_snapshot:
+        save_state_json(state_snapshot)
 
 
 async def update_alert_created_at(app: Application, chat_id: int, symbol: str, tf: str, created_at: float) -> None:
     if not validate_chat_id(chat_id):
         return
 
+    if tf not in ALERT_INTERVALS:
+        return
+
+    valid_symbols = await get_valid_symbols_with_fallback(app)
+    if not validate_symbol(symbol, valid_symbols):
+        return
+
     state_lock: asyncio.Lock = app.bot_data["state_lock"]
+    state_snapshot: Optional[str] = None
     async with state_lock:
         state = app.bot_data.get("state") or {"subs": {}, "alerts": {}}
         alerts = state.setdefault("alerts", {}).setdefault(str(chat_id), {})
@@ -1082,7 +1125,9 @@ async def update_alert_created_at(app: Application, chat_id: int, symbol: str, t
         if key in alerts:
             alerts[key]["created_at"] = float(created_at)
             app.bot_data["state"] = state
-            save_state(copy.deepcopy(state))
+            state_snapshot = json.dumps(state, ensure_ascii=False, indent=2)
+    if state_snapshot:
+        save_state_json(state_snapshot)
 
 
 async def delete_alert_state(
@@ -1101,6 +1146,7 @@ async def delete_alert_state(
             return
 
     state_lock: asyncio.Lock = app.bot_data["state_lock"]
+    state_snapshot: Optional[str] = None
     async with state_lock:
         state = app.bot_data.get("state") or {"subs": {}, "alerts": {}}
         alerts = state.setdefault("alerts", {}).setdefault(str(chat_id), {})
@@ -1108,18 +1154,15 @@ async def delete_alert_state(
         if key in alerts:
             alerts.pop(key, None)
             app.bot_data["state"] = state
-            save_state(copy.deepcopy(state))
+            state_snapshot = json.dumps(state, ensure_ascii=False, indent=2)
+    if state_snapshot:
+        save_state_json(state_snapshot)
 
 
 # =========================
 # CACHES
 # =========================
 async def get_cached_perp_symbols(app: Application) -> List[str]:
-    now = time.time()
-    cached: Optional[CacheItem] = app.bot_data.get("perp_symbols_cache")
-    if cached and (now - cached.ts) <= PERP_SYMBOLS_CACHE_TTL:
-        return cached.value  # type: ignore
-
     cache_lock: asyncio.Lock = app.bot_data["perp_symbols_lock"]
     async with cache_lock:
         now = time.time()
@@ -1135,11 +1178,6 @@ async def get_cached_perp_symbols(app: Application) -> List[str]:
 
 
 async def get_cached_top_symbols(app: Application) -> List[str]:
-    now = time.time()
-    cached: Optional[CacheItem] = app.bot_data.get("tickers_cache")
-    if cached and (now - cached.ts) <= TICKERS_CACHE_TTL:
-        return cached.value  # type: ignore
-
     cache_lock: asyncio.Lock = app.bot_data["tickers_lock"]
     async with cache_lock:
         now = time.time()
@@ -1149,8 +1187,14 @@ async def get_cached_top_symbols(app: Application) -> List[str]:
 
         session: aiohttp.ClientSession = app.bot_data["http_session"]
         rate_limiter: RateLimiter = app.bot_data["rate_limiter"]
-        perp_symbols = await get_cached_perp_symbols(app)
-        top = await pick_top_symbols_by_turnover(session, rate_limiter, set(perp_symbols), MAX_SYMBOLS)
+        try:
+            perp_symbols = await get_cached_perp_symbols(app)
+            top = await pick_top_symbols_by_turnover(session, rate_limiter, set(perp_symbols), MAX_SYMBOLS)
+        except Exception as e:
+            if cached:
+                logging.warning("Failed to refresh tickers cache, using stale data: %s", e)
+                return cached.value  # type: ignore
+            raise
         app.bot_data["tickers_cache"] = CacheItem(ts=now, value=top)
         return top
 
@@ -1228,13 +1272,16 @@ def unschedule_alert(app: Application, chat_id: int, symbol: str, tf: str) -> No
 
 async def restore_alerts(app: Application) -> None:
     state_lock: asyncio.Lock = app.bot_data["state_lock"]
+    state_snapshot: Optional[str] = None
     async with state_lock:
         state = app.bot_data.get("state") or {"subs": {}, "alerts": {}}
         changed = prune_expired_alerts(state)
         alerts_all = copy.deepcopy(state.get("alerts", {}) or {})
         if changed:
             app.bot_data["state"] = state
-            save_state(copy.deepcopy(state))
+            state_snapshot = json.dumps(state, ensure_ascii=False, indent=2)
+    if state_snapshot:
+        save_state_json(state_snapshot)
 
     for chat_id_str, amap in alerts_all.items():
         try:
