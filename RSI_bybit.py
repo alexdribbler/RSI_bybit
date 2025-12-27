@@ -335,6 +335,18 @@ def rsi_wilder(closes: List[float], period: int) -> Optional[float]:
     return 100.0 - (100.0 / (1.0 + rs))
 
 
+def is_long_candidate(rsis: Dict[str, float]) -> bool:
+    if any(val > 50 for val in rsis.values()):
+        return False
+    return not (rsis["5m"] > 35 and rsis["15m"] > 35)
+
+
+def is_short_candidate(rsis: Dict[str, float]) -> bool:
+    if any(val < 70 for val in rsis.values()):
+        return False
+    return not (rsis["5m"] < 80 and rsis["15m"] < 80)
+
+
 async def compute_symbol_rsi_sum(
     session: aiohttp.ClientSession,
     sem: asyncio.Semaphore,
@@ -546,8 +558,12 @@ def pairs_keyboard(long_syms: List[str], short_syms: List[str]) -> InlineKeyboar
         return out
 
     # Long buttons first (same order as table), then Short
-    rows += chunk_buttons(long_syms, "L")
-    rows += chunk_buttons(short_syms, "S")
+    if long_syms:
+        rows.append([InlineKeyboardButton("— LONG —", callback_data="SECTION|LONG")])
+        rows += chunk_buttons(long_syms, "L")
+    if short_syms:
+        rows.append([InlineKeyboardButton("— SHORT —", callback_data="SECTION|SHORT")])
+        rows += chunk_buttons(short_syms, "S")
 
     return InlineKeyboardMarkup(rows)
 
@@ -778,9 +794,14 @@ async def run_monitor_once(app: Application, chat_id: int):
         await app.bot.send_message(chat_id=chat_id, text="Не получилось собрать RSI (rate limit/временная ошибка).")
         return
 
-    results.sort(key=lambda x: x[1])
-    long_rows = results[:10]
-    short_rows = list(reversed(results[-10:]))
+    long_candidates = [r for r in results if is_long_candidate(r[2])]
+    short_candidates = [r for r in results if is_short_candidate(r[2])]
+
+    long_candidates.sort(key=lambda x: x[1])
+    short_candidates.sort(key=lambda x: x[1], reverse=True)
+
+    long_rows = long_candidates[:10]
+    short_rows = short_candidates[:10]
 
     await send_scan_result(app, chat_id, long_rows, short_rows, symbols_scanned=len(results))
 
@@ -997,6 +1018,10 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception as e:
             logging.exception("RUN_NOW failed: %s", e)
             await app.bot.send_message(chat_id=chat_id, text=f"Ошибка: {e}")
+        return
+
+    if data.startswith("SECTION|"):
+        await query.answer()
         return
 
     # Click on symbol from list
