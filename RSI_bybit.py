@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import asyncio
+import contextlib
 import json
 import logging
 import os
@@ -56,6 +57,7 @@ ALERT_TFS: List[Tuple[str, str]] = [
     ("15m", "15"),
     ("30m", "30"),
 ]
+ALERT_INTERVALS = {iv for _, iv in ALERT_TFS}
 
 ALERT_CHECK_SEC = int(os.getenv("ALERT_CHECK_SEC", "300"))  # check every 5 minutes by default
 ALERT_EPS = float(os.getenv("ALERT_EPS", "0.10"))  # "equals threshold" tolerance
@@ -1056,10 +1058,10 @@ async def run_monitor_once_internal(app: Application, chat_id: int):
                 continue
     finally:
         for task in tasks:
-            if not task.done():
-                task.cancel()
+            task.cancel()
         if tasks:
-            await asyncio.gather(*tasks, return_exceptions=True)
+            with contextlib.suppress(asyncio.CancelledError):
+                await asyncio.shield(asyncio.gather(*tasks, return_exceptions=True))
 
     # Calculate error rate
     error_rate = error_count / total_tasks if total_tasks > 0 else 0
@@ -1131,6 +1133,9 @@ async def alert_job_callback(context: ContextTypes.DEFAULT_TYPE):
     side = data.get("side")
     
     if not symbol or not tf or not side:
+        return
+    if tf not in ALERT_INTERVALS:
+        logging.warning("Invalid tf for alert: %s", tf)
         return
     if side not in {"L", "S"}:
         return
@@ -1453,6 +1458,9 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             _, tf, side, symbol = parts
             if side not in {"L", "S"}:
                 await app.bot.send_message(chat_id=chat_id, text="Некорректное направление. Выберите пару заново.")
+                return
+            if tf not in ALERT_INTERVALS:
+                await app.bot.send_message(chat_id=chat_id, text="Некорректный таймфрейм.")
                 return
             
             # Get valid symbols for validation
