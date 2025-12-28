@@ -83,6 +83,7 @@ ALERT_SHORT_THRESHOLD = float(os.getenv("ALERT_SHORT_THRESHOLD", "60"))
 PRICE_ALERT_CHECK_SEC = int(os.getenv("PRICE_ALERT_CHECK_SEC", "180"))
 ALERT_ERROR_THROTTLE_MIN = int(os.getenv("ALERT_ERROR_THROTTLE_MIN", "30"))
 ALERT_ERROR_NOTIFY_TTL_HOURS = float(os.getenv("ALERT_ERROR_NOTIFY_TTL_HOURS", "24"))
+ALERT_COOLDOWN_CACHE_TTL_SEC = int(os.getenv("ALERT_COOLDOWN_CACHE_TTL_SEC", str(24 * 3600)))
 MAX_ALERTS_PER_CHAT = int(os.getenv("MAX_ALERTS_PER_CHAT", "50"))
 MAX_ALERTS_GLOBAL = int(os.getenv("MAX_ALERTS_GLOBAL", "1000"))
 ALERT_TTL_HOURS = float(os.getenv("ALERT_TTL_HOURS", "24"))
@@ -270,9 +271,29 @@ def save_state_json(state_json: str) -> bool:
     return False
 
 
+async def save_state_json_with_retry(state_json: str, attempts: int = 3) -> bool:
+    delay = 0.2
+    for _ in range(attempts):
+        if save_state_json(state_json):
+            return True
+        await asyncio.sleep(delay)
+        delay *= 2
+    return False
+
+
+def _json_default(value: object) -> object:
+    if isinstance(value, Decimal):
+        return float(value)
+    if isinstance(value, datetime):
+        return value.isoformat()
+    if isinstance(value, set):
+        return sorted(value)
+    raise TypeError(f"Not JSON serializable: {type(value).__name__}")
+
+
 def save_state(state: dict) -> None:
     try:
-        state_json = json.dumps(state, ensure_ascii=False, indent=2)
+        state_json = json.dumps(state, ensure_ascii=False, indent=2, default=_json_default)
     except Exception as e:
         logging.warning("Failed to serialize state: %s", e)
         return
@@ -321,9 +342,6 @@ async def persist_state(app: Application, state: dict) -> None:
         app.bot_data["state_save_last_requested_seq"] = app.bot_data["state_save_seq"]
     save_done.clear()
     save_event.set()
-    save_task: Optional[asyncio.Task] = app.bot_data.get("state_save_task")
-    if save_task is None or save_task.done():
-        app.bot_data["state_save_task"] = asyncio.create_task(state_save_worker(app))
 
 
 async def state_save_worker(app: Application) -> None:
@@ -345,13 +363,17 @@ async def state_save_worker(app: Application) -> None:
                     )
                 )
             try:
-                state_json = json.dumps(snapshot, ensure_ascii=False, indent=2)
+                state_json = json.dumps(snapshot, ensure_ascii=False, indent=2, default=_json_default)
             except Exception as e:
                 logging.warning("Failed to serialize state: %s", e)
                 continue
             write_lock: asyncio.Lock = app.bot_data["state_write_lock"]
             async with write_lock:
-                save_state_json(state_json)
+                ok = await save_state_json_with_retry(state_json, attempts=3)
+            if not ok:
+                await asyncio.sleep(2)
+                save_event.set()
+                continue
             async with seq_lock:
                 seq_after = app.bot_data["state_save_seq"]
             if seq_after == seq_before:
@@ -530,12 +552,14 @@ def normalize_symbol(raw: str) -> Optional[str]:
     """Normalize user-entered symbol into Bybit linear USDT format."""
     if not isinstance(raw, str):
         return None
-    cleaned = "".join(ch for ch in raw.strip().upper() if ch.isalnum())
-    if not cleaned or len(cleaned) > 30:
+    raw_cleaned = raw.strip().upper()
+    if not raw_cleaned or len(raw_cleaned) > 30:
         return None
-    if not cleaned.endswith("USDT"):
+    if not raw_cleaned.isalnum():
         return None
-    return cleaned
+    if not raw_cleaned.endswith("USDT"):
+        return None
+    return raw_cleaned
 
 
 def parse_price_input(raw: str) -> Optional[Decimal]:
@@ -703,7 +727,7 @@ async def api_get_json(
                 break
             await asyncio.sleep(backoff)
             backoff *= 1.7
-        except (asyncio.TimeoutError, aiohttp.ClientError, BybitAPIError) as e:
+        except (asyncio.TimeoutError, aiohttp.ClientError, BybitAPIError, OSError, ConnectionError) as e:
             last_err = e
             attempt += 1
             if attempt >= retries:
@@ -905,12 +929,21 @@ async def get_kline_rows(
     return rows
 
 
-async def get_kline_closes(session: aiohttp.ClientSession, rate_limiter: RateLimiter, symbol: str, interval: str, limit: int) -> List[float]:
+async def get_kline_closes(
+    session: aiohttp.ClientSession,
+    rate_limiter: RateLimiter,
+    symbol: str,
+    interval: str,
+    limit: int,
+    fallback_used: bool = False,
+) -> List[float]:
     try:
         rows = await get_kline_rows(session, rate_limiter, symbol, interval, limit)
         if not rows:
             raise BybitAPIError(f"No kline rows for {symbol} interval={interval} limit={limit}")
     except RateLimitError as e:
+        if fallback_used:
+            raise e
         tf_label = TIMEFRAME_BY_INTERVAL.get(interval, interval)
         logging.warning(
             "Bybit rate limit for RSI klines (%s, %s). Falling back to Binance.",
@@ -2704,9 +2737,8 @@ async def cleanup_job(context: ContextTypes.DEFAULT_TYPE) -> None:
     notify_cache = app.bot_data.setdefault("alert_error_notify", {})
     prune_ttl_dict(notify_cache, ALERT_ERROR_NOTIFY_TTL_HOURS * 3600, now)
 
-    if ALERT_COOLDOWN_SEC > 0:
-        cooldowns = app.bot_data.setdefault("alert_cooldowns", {})
-        prune_ttl_dict(cooldowns, ALERT_COOLDOWN_SEC, now)
+    cooldowns = app.bot_data.setdefault("alert_cooldowns", {})
+    prune_ttl_dict(cooldowns, ALERT_COOLDOWN_CACHE_TTL_SEC, now)
 
     monitor_tasks: Set[asyncio.Task] = app.bot_data.get("monitor_tasks", set())
     if monitor_tasks:
