@@ -44,7 +44,7 @@ load_dotenv(os.path.join(BASE_DIR, ".env"))
 # CONFIG
 # =========================
 BYBIT_BASE_URL = os.getenv("BYBIT_BASE_URL", "https://api.bybit.com").rstrip("/")
-BINANCE_BASE_URL = "https://api.binance.com"
+BINANCE_FUTURES_BASE_URL = "https://fapi.binance.com"
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 
 RSI_PERIOD = 6
@@ -78,6 +78,10 @@ STOCH_RSI_TFS: List[Tuple[str, str]] = list(TIMEFRAMES)
 
 PAIR_RSI_LOW_THRESHOLD = float(os.getenv("PAIR_RSI_LOW_THRESHOLD", "15"))
 PAIR_RSI_HIGH_THRESHOLD = float(os.getenv("PAIR_RSI_HIGH_THRESHOLD", "90"))
+MONITOR_LONG_ALL_MAX = float(os.getenv("MONITOR_LONG_ALL_MAX", "50"))
+MONITOR_LONG_FAST_MAX = float(os.getenv("MONITOR_LONG_FAST_MAX", "35"))
+MONITOR_SHORT_ALL_MIN = float(os.getenv("MONITOR_SHORT_ALL_MIN", "70"))
+MONITOR_SHORT_FAST_MIN = float(os.getenv("MONITOR_SHORT_FAST_MIN", "80"))
 
 ALERT_CHECK_SEC = int(os.getenv("ALERT_CHECK_SEC", "300"))  # check every 5 minutes by default
 ALERT_EPS = float(os.getenv("ALERT_EPS", "0.10"))  # "equals threshold" tolerance
@@ -95,6 +99,7 @@ ALERT_MAX_BACKOFF_SEC = int(os.getenv("ALERT_MAX_BACKOFF_SEC", "3600"))
 SHUTDOWN_TASK_TIMEOUT = int(os.getenv("SHUTDOWN_TASK_TIMEOUT", "10"))
 CLEANUP_INTERVAL_SEC = int(os.getenv("CLEANUP_INTERVAL_SEC", "600"))
 ALERT_MAX_CONCURRENCY = int(os.getenv("ALERT_MAX_CONCURRENCY", "10"))
+BINANCE_SYMBOLS_CACHE_TTL = int(os.getenv("BINANCE_SYMBOLS_CACHE_TTL", "3600"))
 
 MAX_SYMBOLS = int(os.getenv("MAX_SYMBOLS", "200"))
 MAX_CONCURRENCY = int(os.getenv("MAX_CONCURRENCY", "20"))  # Increased from 10 for better performance
@@ -182,6 +187,8 @@ def validate_config() -> None:
         errors.append("ALERT_MAX_BACKOFF_SEC must be > 0")
     if ALERT_MAX_CONCURRENCY <= 0:
         errors.append("ALERT_MAX_CONCURRENCY must be > 0")
+    if BINANCE_SYMBOLS_CACHE_TTL <= 0:
+        errors.append("BINANCE_SYMBOLS_CACHE_TTL must be > 0")
     if MAX_SYMBOLS <= 0:
         errors.append("MAX_SYMBOLS must be > 0")
     if MAX_CONCURRENCY <= 0:
@@ -194,6 +201,14 @@ def validate_config() -> None:
         errors.append("STOCH_RSI_PERIOD must be > 0")
     if not (0 <= PAIR_RSI_LOW_THRESHOLD < PAIR_RSI_HIGH_THRESHOLD <= 100):
         errors.append("PAIR_RSI thresholds must be 0 <= low < high <= 100")
+    if not (0 <= MONITOR_LONG_ALL_MAX <= 100):
+        errors.append("MONITOR_LONG_ALL_MAX must be within 0..100")
+    if not (0 <= MONITOR_LONG_FAST_MAX <= 100):
+        errors.append("MONITOR_LONG_FAST_MAX must be within 0..100")
+    if not (0 <= MONITOR_SHORT_ALL_MIN <= 100):
+        errors.append("MONITOR_SHORT_ALL_MIN must be within 0..100")
+    if not (0 <= MONITOR_SHORT_FAST_MIN <= 100):
+        errors.append("MONITOR_SHORT_FAST_MIN must be within 0..100")
     if RATE_LIMIT_DELAY <= 0:
         errors.append("RATE_LIMIT_DELAY must be > 0")
     if RATE_LIMIT_MAX_DELAY < RATE_LIMIT_DELAY:
@@ -626,6 +641,10 @@ class BinanceAPIError(Exception):
     pass
 
 
+BINANCE_SYMBOLS_CACHE: Optional[CacheItem] = None
+BINANCE_SYMBOLS_CACHE_LOCK: Optional[asyncio.Lock] = None
+
+
 class RateLimiter:
     """Global rate limiter with dynamic backoff and queue timeout."""
     
@@ -870,7 +889,7 @@ async def binance_get_klines(
     binance_interval = BYBIT_TO_BINANCE_INTERVAL.get(bybit_interval)
     if not binance_interval:
         raise BinanceAPIError(f"Unsupported Binance interval mapping: {bybit_interval}")
-    url = f"{BINANCE_BASE_URL}/api/v3/klines"
+    url = f"{BINANCE_FUTURES_BASE_URL}/fapi/v1/klines"
     params = {"symbol": symbol, "interval": binance_interval, "limit": str(limit)}
     data = None
     backoff = 1.0
@@ -940,6 +959,68 @@ async def binance_get_closes(
     return closes
 
 
+async def get_binance_futures_symbols(session: aiohttp.ClientSession) -> Set[str]:
+    global BINANCE_SYMBOLS_CACHE
+    global BINANCE_SYMBOLS_CACHE_LOCK
+
+    if BINANCE_SYMBOLS_CACHE_LOCK is None:
+        BINANCE_SYMBOLS_CACHE_LOCK = asyncio.Lock()
+
+    async with BINANCE_SYMBOLS_CACHE_LOCK:
+        now = time.time()
+        if BINANCE_SYMBOLS_CACHE and (now - BINANCE_SYMBOLS_CACHE.ts) <= BINANCE_SYMBOLS_CACHE_TTL:
+            return BINANCE_SYMBOLS_CACHE.value  # type: ignore[return-value]
+
+        url = f"{BINANCE_FUTURES_BASE_URL}/fapi/v1/exchangeInfo"
+        try:
+            data = None
+            backoff = 1.0
+            for attempt in range(1, 4):
+                try:
+                    async with session.get(
+                        url,
+                        timeout=aiohttp.ClientTimeout(total=API_GET_REQUEST_TIMEOUT),
+                    ) as resp:
+                        if resp.status != 200:
+                            text = await resp.text()
+                            raise BinanceAPIError(
+                                f"HTTP {resp.status} while fetching Binance futures symbols: {text[:200]}"
+                            )
+                        data = await resp.json(content_type=None)
+                        break
+                except (asyncio.TimeoutError, aiohttp.ClientError, OSError):
+                    if attempt >= 3:
+                        raise
+                    await asyncio.sleep(backoff)
+                    backoff = min(backoff * 2, 30.0)
+
+            symbols: Set[str] = set()
+            for item in (data or {}).get("symbols", []):
+                if not isinstance(item, dict):
+                    continue
+                if item.get("contractType") != "PERPETUAL":
+                    continue
+                if item.get("status") not in {"TRADING", "PRE_TRADING"}:
+                    continue
+                sym = item.get("symbol")
+                if isinstance(sym, str):
+                    symbols.add(sym)
+
+            if not symbols:
+                raise BinanceAPIError("No Binance futures symbols found in exchangeInfo")
+        except Exception as exc:
+            if BINANCE_SYMBOLS_CACHE:
+                logging.warning(
+                    "Failed to refresh Binance futures symbols cache, using stale data: %s",
+                    exc,
+                )
+                return BINANCE_SYMBOLS_CACHE.value  # type: ignore[return-value]
+            raise
+
+        BINANCE_SYMBOLS_CACHE = CacheItem(ts=now, value=symbols)
+        return symbols
+
+
 async def get_kline_rows(
     session: aiohttp.ClientSession,
     rate_limiter: RateLimiter,
@@ -988,6 +1069,21 @@ async def get_kline_closes(
             tf_label,
         )
         try:
+            binance_symbols = await get_binance_futures_symbols(session)
+        except Exception as symbols_err:
+            logging.warning(
+                "Failed to load Binance futures symbols for fallback (%s): %s",
+                symbol,
+                symbols_err,
+            )
+            raise e
+        if symbol not in binance_symbols:
+            logging.warning(
+                "Binance futures symbol not found for %s; skipping fallback.",
+                symbol,
+            )
+            raise e
+        try:
             return await binance_get_closes(session, symbol, interval, limit)
         except Exception as binance_err:
             logging.warning(
@@ -997,20 +1093,21 @@ async def get_kline_closes(
                 binance_err,
             )
             raise e
-    closes: List[float] = []
+    closes_with_ts: List[Tuple[float, float]] = []
     for c in rows:
         # [startTime, open, high, low, close, volume, turnover]
         if not isinstance(c, list) or len(c) < 5:
             continue
         try:
+            ts = float(c[0])
             value = float(c[4])
-            if not math.isfinite(value):
+            if not math.isfinite(ts) or not math.isfinite(value):
                 continue
-            closes.append(value)
+            closes_with_ts.append((ts, value))
         except Exception:
             continue
-    # Reverse to get oldest first for RSI calculation
-    closes.reverse()
+    closes_with_ts.sort(key=lambda item: item[0])
+    closes = [value for _, value in closes_with_ts]
     return closes
 
 
@@ -1090,15 +1187,21 @@ def stoch_rsi_from_closes(
 
 
 def is_long_candidate(rsis: Dict[str, float]) -> bool:
-    if any(val > 50 for val in rsis.values()):
+    if any(val > MONITOR_LONG_ALL_MAX for val in rsis.values()):
         return False
-    return rsis["5m"] <= 35 and rsis["15m"] <= 35
+    return (
+        rsis.get("5m", 101.0) <= MONITOR_LONG_FAST_MAX
+        and rsis.get("15m", 101.0) <= MONITOR_LONG_FAST_MAX
+    )
 
 
 def is_short_candidate(rsis: Dict[str, float]) -> bool:
-    if any(val < 70 for val in rsis.values()):
+    if any(val < MONITOR_SHORT_ALL_MIN for val in rsis.values()):
         return False
-    return rsis["5m"] >= 80 and rsis["15m"] >= 80
+    return (
+        rsis.get("5m", -1.0) >= MONITOR_SHORT_FAST_MIN
+        and rsis.get("15m", -1.0) >= MONITOR_SHORT_FAST_MIN
+    )
 
 
 async def compute_symbol_rsi_sum(
@@ -2662,9 +2765,8 @@ async def run_monitor_once(app: Application, chat_id: int):
     locks = app.bot_data.setdefault("monitor_locks", {})
     lock = locks.setdefault(chat_id, asyncio.Lock())
 
-    try:
-        await asyncio.wait_for(lock.acquire(), timeout=0)
-    except asyncio.TimeoutError:
+    if lock.locked():
+        await app.bot.send_message(chat_id=chat_id, text="⏳ Мониторинг уже выполняется, подождите…")
         return
 
     monitor_tasks: Set[asyncio.Task] = app.bot_data.setdefault("monitor_tasks", set())
@@ -2672,11 +2774,14 @@ async def run_monitor_once(app: Application, chat_id: int):
     try:
         if current_task:
             monitor_tasks.add(current_task)
+        await lock.acquire()
         rate_limiter: RateLimiter = app.bot_data["rate_limiter"]
         current_delay = await rate_limiter.get_current_delay()
         delay_factor = max(1.0, current_delay / RATE_LIMIT_DELAY)
         adaptive_timeout = int(MONITOR_TIMEOUT * delay_factor)
+        logging.info("monitor_start chat_id=%s timeout=%ss", chat_id, adaptive_timeout)
         await run_monitor_once_internal(app, chat_id, timeout_sec=adaptive_timeout)
+        logging.info("monitor_done chat_id=%s", chat_id)
     finally:
         lock.release()
         if current_task:
