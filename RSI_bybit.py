@@ -91,6 +91,7 @@ ALERT_COOLDOWN_SEC = int(os.getenv("ALERT_COOLDOWN_SEC", "0"))
 ALERT_MAX_BACKOFF_SEC = int(os.getenv("ALERT_MAX_BACKOFF_SEC", "3600"))
 SHUTDOWN_TASK_TIMEOUT = int(os.getenv("SHUTDOWN_TASK_TIMEOUT", "10"))
 CLEANUP_INTERVAL_SEC = int(os.getenv("CLEANUP_INTERVAL_SEC", "600"))
+ALERT_MAX_CONCURRENCY = int(os.getenv("ALERT_MAX_CONCURRENCY", "10"))
 
 MAX_SYMBOLS = int(os.getenv("MAX_SYMBOLS", "200"))
 MAX_CONCURRENCY = int(os.getenv("MAX_CONCURRENCY", "20"))  # Increased from 10 for better performance
@@ -176,6 +177,8 @@ def validate_config() -> None:
         errors.append("ALERT_COOLDOWN_SEC must be >= 0")
     if ALERT_MAX_BACKOFF_SEC <= 0:
         errors.append("ALERT_MAX_BACKOFF_SEC must be > 0")
+    if ALERT_MAX_CONCURRENCY <= 0:
+        errors.append("ALERT_MAX_CONCURRENCY must be > 0")
     if MAX_SYMBOLS <= 0:
         errors.append("MAX_SYMBOLS must be > 0")
     if MAX_CONCURRENCY <= 0:
@@ -340,8 +343,8 @@ async def persist_state(app: Application, state: dict) -> None:
     async with seq_lock:
         app.bot_data["state_save_seq"] += 1
         app.bot_data["state_save_last_requested_seq"] = app.bot_data["state_save_seq"]
-    save_done.clear()
-    save_event.set()
+        save_done.clear()
+        save_event.set()
 
 
 async def state_save_worker(app: Application) -> None:
@@ -852,20 +855,37 @@ async def binance_get_klines(
     symbol: str,
     bybit_interval: str,
     limit: int,
+    *,
+    timeout_sec: int = API_GET_REQUEST_TIMEOUT,
+    max_retries: int = 3,
 ) -> List[list]:
     binance_interval = BYBIT_TO_BINANCE_INTERVAL.get(bybit_interval)
     if not binance_interval:
         raise BinanceAPIError(f"Unsupported Binance interval mapping: {bybit_interval}")
     url = f"{BINANCE_BASE_URL}/api/v3/klines"
     params = {"symbol": symbol, "interval": binance_interval, "limit": str(limit)}
-    async with session.get(
-        url,
-        params=params,
-        timeout=aiohttp.ClientTimeout(total=API_GET_REQUEST_TIMEOUT),
-    ) as resp:
-        if resp.status >= 400:
-            raise BinanceAPIError(f"HTTP {resp.status} while fetching Binance klines")
-        data = await resp.json(content_type=None)
+    backoff = 1.0
+    for attempt in range(1, max_retries + 1):
+        try:
+            async with session.get(
+                url,
+                params=params,
+                timeout=aiohttp.ClientTimeout(total=timeout_sec),
+            ) as resp:
+                if resp.status in (418, 429):
+                    raise RateLimitError(f"Binance rate limit HTTP {resp.status}")
+                if resp.status != 200:
+                    text = await resp.text()
+                    raise BinanceAPIError(
+                        f"HTTP {resp.status} while fetching Binance klines: {text[:200]}"
+                    )
+                data = await resp.json(content_type=None)
+                break
+        except (asyncio.TimeoutError, aiohttp.ClientError, OSError):
+            if attempt >= max_retries:
+                raise
+            await asyncio.sleep(backoff)
+            backoff = min(backoff * 2, 8.0)
     if not isinstance(data, list):
         raise BinanceAPIError(f"Unexpected Binance payload type: {type(data).__name__}")
     if not data:
@@ -1817,6 +1837,79 @@ async def get_alerts_for_chat(app: Application, chat_id: int) -> Dict[str, dict]
         return copy.deepcopy(alerts.get(str(chat_id), {}))
 
 
+async def get_alert_entry(app: Application, chat_id: int, key: str) -> Optional[dict]:
+    if not validate_chat_id(chat_id):
+        return None
+    state_lock: asyncio.Lock = app.bot_data["state_lock"]
+    async with state_lock:
+        state = app.bot_data.get("state") or {
+            "subs": {},
+            "alerts": {},
+            "pair_rsi_alerts": {},
+            "price_alerts": {},
+        }
+        entry = state.get("alerts", {}).get(str(chat_id), {}).get(key)
+        if isinstance(entry, dict):
+            return copy.deepcopy(entry)
+        return None
+
+
+_ALERT_ENTRY_MISSING = object()
+
+
+async def update_alert_entry(
+    app: Application,
+    chat_id: int,
+    symbol: str,
+    tf: str,
+    *,
+    created_at: object = _ALERT_ENTRY_MISSING,
+    last_above: object = _ALERT_ENTRY_MISSING,
+    delete: bool = False,
+) -> bool:
+    if not validate_chat_id(chat_id):
+        return False
+    state_lock: asyncio.Lock = app.bot_data["state_lock"]
+    async with state_lock:
+        state = app.bot_data.get("state") or {
+            "subs": {},
+            "alerts": {},
+            "pair_rsi_alerts": {},
+            "price_alerts": {},
+        }
+        alerts = state.setdefault("alerts", {}).setdefault(str(chat_id), {})
+        key = f"{symbol}|{tf}"
+        if key not in alerts:
+            return False
+        if delete:
+            alerts.pop(key, None)
+            app.bot_data["state"] = state
+            log_state_change(state, "delete_alert_state", chat_id=chat_id, symbol=symbol, tf=tf)
+            await persist_state(app, state)
+            return True
+        updated = False
+        entry = alerts[key]
+        if created_at is not _ALERT_ENTRY_MISSING:
+            entry["created_at"] = float(created_at)
+            updated = True
+        if last_above is not _ALERT_ENTRY_MISSING:
+            entry["last_above"] = bool(last_above)
+            updated = True
+        if updated:
+            app.bot_data["state"] = state
+            log_state_change(
+                state,
+                "update_alert_entry",
+                chat_id=chat_id,
+                symbol=symbol,
+                tf=tf,
+                last_above=entry.get("last_above"),
+                created_at=entry.get("created_at"),
+            )
+            await persist_state(app, state)
+        return updated
+
+
 def alert_ttl_seconds() -> float:
     return ALERT_TTL_HOURS * 3600
 
@@ -2486,12 +2579,10 @@ async def run_monitor_once_internal(app: Application, chat_id: int, timeout_sec:
                 task.cancel()
     finally:
         if tasks:
-            gather_task = asyncio.gather(*tasks, return_exceptions=True)
-            try:
-                await asyncio.shield(gather_task)
-            except asyncio.CancelledError:
-                await gather_task
-                raise
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
 
     # Calculate error rate
     processed_count = success_count + error_count
@@ -2551,16 +2642,25 @@ async def run_monitor_once_internal(app: Application, chat_id: int, timeout_sec:
 
 async def run_monitor_once(app: Application, chat_id: int):
     """Run monitor with timeout protection."""
+    locks = app.bot_data.setdefault("monitor_locks", {})
+    lock = locks.get(chat_id)
+    if lock is None:
+        lock = locks[chat_id] = asyncio.Lock()
+
+    if lock.locked():
+        return
+
     monitor_tasks: Set[asyncio.Task] = app.bot_data.setdefault("monitor_tasks", set())
     current_task = asyncio.current_task()
-    if current_task:
-        monitor_tasks.add(current_task)
     try:
+        if current_task:
+            monitor_tasks.add(current_task)
         rate_limiter: RateLimiter = app.bot_data["rate_limiter"]
         current_delay = await rate_limiter.get_current_delay()
         delay_factor = max(1.0, current_delay / RATE_LIMIT_DELAY)
         adaptive_timeout = int(MONITOR_TIMEOUT * delay_factor)
-        await run_monitor_once_internal(app, chat_id, timeout_sec=adaptive_timeout)
+        async with lock:
+            await run_monitor_once_internal(app, chat_id, timeout_sec=adaptive_timeout)
     finally:
         if current_task:
             monitor_tasks.discard(current_task)
@@ -2603,72 +2703,94 @@ async def alert_job_callback(context: ContextTypes.DEFAULT_TYPE):
         return
 
     app = context.application
-    now = time.time()
-    backoff_sec = int(data.get("backoff_sec") or 0)
-    next_retry_ts = float(data.get("next_retry_ts") or 0.0)
-    if backoff_sec > 0 and now < next_retry_ts:
-        return
-    notify_cache = app.bot_data.setdefault("alert_error_notify", {})
-    ttl_sec = ALERT_ERROR_NOTIFY_TTL_HOURS * 3600
-    last_prune = app.bot_data.get("alert_error_notify_last_prune", 0.0)
-    if ttl_sec > 0 and now - last_prune >= 600:
-        prune_ttl_dict(notify_cache, ttl_sec, now)
-        app.bot_data["alert_error_notify_last_prune"] = now
-
-    key = f"{symbol}|{tf}"
-    alerts_map = await get_alerts_for_chat(app, chat_id)
-    entry = alerts_map.get(key)
-    if not entry:
-        unschedule_alert(app, chat_id, symbol, tf)
-        return
-
-    created_at = entry.get("created_at")
-    if created_at is None:
-        await update_alert_created_at(app, chat_id, symbol, tf, time.time())
-    elif is_alert_expired(created_at):
-        unschedule_alert(app, chat_id, symbol, tf)
-        await delete_alert_state(app, chat_id, symbol, tf, validate_symbol_check=False)
-        return
-    
-    session: aiohttp.ClientSession = app.bot_data["http_session"]
-    rate_limiter: RateLimiter = app.bot_data["rate_limiter"]
-
-    try:
-        sem: asyncio.Semaphore = app.bot_data["http_sem"]
-        async with sem:
-            valid_symbols = await get_valid_symbols_with_fallback(app)
-        if not valid_symbols:
-            logging.warning("Valid symbols whitelist unavailable for alert check")
+    alert_sem: asyncio.Semaphore = app.bot_data["alert_sem"]
+    async with alert_sem:
+        now = time.time()
+        backoff_sec = int(data.get("backoff_sec") or 0)
+        next_retry_ts = float(data.get("next_retry_ts") or 0.0)
+        if backoff_sec > 0 and now < next_retry_ts:
             return
-        if not validate_symbol(symbol, valid_symbols):
-            logging.warning("Invalid symbol for alert: %s", symbol)
-            return
-        async with sem:
-            closes = await get_kline_closes(session, rate_limiter, symbol, tf, KLINE_LIMIT)
-        rsi = rsi_wilder(closes, RSI_PERIOD)
-        if rsi is None:
+        notify_cache = app.bot_data.setdefault("alert_error_notify", {})
+        ttl_sec = ALERT_ERROR_NOTIFY_TTL_HOURS * 3600
+        last_prune = app.bot_data.get("alert_error_notify_last_prune", 0.0)
+        if ttl_sec > 0 and now - last_prune >= 600:
+            prune_ttl_dict(notify_cache, ttl_sec, now)
+            app.bot_data["alert_error_notify_last_prune"] = now
+
+        key = f"{symbol}|{tf}"
+        entry = await get_alert_entry(app, chat_id, key)
+        if not entry:
+            unschedule_alert(app, chat_id, symbol, tf)
             return
 
-        prev = entry.get("last_above", None)
+        created_at = entry.get("created_at")
+        if created_at is not None and is_alert_expired(created_at):
+            unschedule_alert(app, chat_id, symbol, tf)
+            await update_alert_entry(app, chat_id, symbol, tf, delete=True)
+            return
 
-        if side == "L":
-            threshold = ALERT_LONG_THRESHOLD
-            condition_met = bool(rsi >= threshold)
-            direction_label = "LONG"
-            trigger_label = f">= {threshold:.0f}"
-        else:
-            threshold = ALERT_SHORT_THRESHOLD
-            condition_met = bool(rsi <= threshold)
-            direction_label = "SHORT"
-            trigger_label = f"<= {threshold:.0f}"
+        created_at_update = now if created_at is None else _ALERT_ENTRY_MISSING
 
-        near = abs(rsi - threshold) <= ALERT_EPS
+        session: aiohttp.ClientSession = app.bot_data["http_session"]
+        rate_limiter: RateLimiter = app.bot_data["rate_limiter"]
 
-        # First run: do not spam, but alert if already met or near threshold.
-        if prev is None:
-            await update_alert_last_above(app, chat_id, symbol, tf, condition_met)
-            if condition_met or near:
-                extra = f"hit {trigger_label}" if condition_met else f"hit ≈ {threshold:.0f}"
+        try:
+            sem: asyncio.Semaphore = app.bot_data["http_sem"]
+            async with sem:
+                valid_symbols = await get_valid_symbols_with_fallback(app)
+            if not valid_symbols:
+                logging.warning("Valid symbols whitelist unavailable for alert check")
+                return
+            if not validate_symbol(symbol, valid_symbols):
+                logging.warning("Invalid symbol for alert: %s", symbol)
+                return
+            async with sem:
+                closes = await get_kline_closes(session, rate_limiter, symbol, tf, KLINE_LIMIT)
+            rsi = rsi_wilder(closes, RSI_PERIOD)
+            if rsi is None:
+                return
+
+            prev = entry.get("last_above", None)
+
+            if side == "L":
+                threshold = ALERT_LONG_THRESHOLD
+                condition_met = bool(rsi >= threshold)
+                direction_label = "LONG"
+                trigger_label = f">= {threshold:.0f}"
+            else:
+                threshold = ALERT_SHORT_THRESHOLD
+                condition_met = bool(rsi <= threshold)
+                direction_label = "SHORT"
+                trigger_label = f"<= {threshold:.0f}"
+
+            near = abs(rsi - threshold) <= ALERT_EPS
+
+            # First run: do not spam, but alert if already met or near threshold.
+            if prev is None:
+                await update_alert_entry(
+                    app,
+                    chat_id,
+                    symbol,
+                    tf,
+                    last_above=condition_met,
+                    created_at=created_at_update,
+                )
+                if condition_met or near:
+                    extra = f"hit {trigger_label}" if condition_met else f"hit ≈ {threshold:.0f}"
+                    await app.bot.send_message(
+                        chat_id=chat_id,
+                        text=(
+                            f"🔔 ALERT {symbol} {direction_label} RSI{RSI_PERIOD}({tf_label}) {extra}\n"
+                            f"Current RSI: {rsi:.2f}"
+                        ),
+                    )
+                    unschedule_alert(app, chat_id, symbol, tf)
+                    await update_alert_entry(app, chat_id, symbol, tf, delete=True)
+                return
+
+            triggered = (not prev) and condition_met
+            if triggered or near:
+                extra = f"hit {trigger_label}" if triggered else f"hit ≈ {threshold:.0f}"
                 await app.bot.send_message(
                     chat_id=chat_id,
                     text=(
@@ -2677,57 +2799,51 @@ async def alert_job_callback(context: ContextTypes.DEFAULT_TYPE):
                     ),
                 )
                 unschedule_alert(app, chat_id, symbol, tf)
-                await delete_alert_state(app, chat_id, symbol, tf)
-            return
+                await update_alert_entry(app, chat_id, symbol, tf, delete=True)
+                return
 
-        triggered = (not prev) and condition_met
-        if triggered or near:
-            extra = f"hit {trigger_label}" if triggered else f"hit ≈ {threshold:.0f}"
-            await app.bot.send_message(
-                chat_id=chat_id,
-                text=(
-                    f"🔔 ALERT {symbol} {direction_label} RSI{RSI_PERIOD}({tf_label}) {extra}\n"
-                    f"Current RSI: {rsi:.2f}"
-                ),
+            await update_alert_entry(
+                app,
+                chat_id,
+                symbol,
+                tf,
+                last_above=condition_met,
+                created_at=created_at_update,
             )
-            unschedule_alert(app, chat_id, symbol, tf)
-            await delete_alert_state(app, chat_id, symbol, tf)
 
-        await update_alert_last_above(app, chat_id, symbol, tf, condition_met)
+            if backoff_sec > 0:
+                data["backoff_sec"] = 0
+                data["next_retry_ts"] = 0.0
+        except Exception as e:
+            logging.exception("alert job failed for %s: %s", symbol, e)
+            notify_key = (chat_id, symbol, tf)
+            last_sent = notify_cache.get(notify_key, 0.0)
+            throttle_sec = ALERT_ERROR_THROTTLE_MIN * 60
+            if now - last_sent >= throttle_sec:
+                try:
+                    await app.bot.send_message(
+                        chat_id=chat_id,
+                        text=f"Alert {symbol}({tf_label}) временно не проверяется из-за ошибки API.",
+                    )
+                    notify_cache[notify_key] = now
+                except Exception:
+                    logging.error("Failed to send alert error message to chat %s", chat_id)
 
-        if backoff_sec > 0:
-            data["backoff_sec"] = 0
-            data["next_retry_ts"] = 0.0
-    except Exception as e:
-        logging.exception("alert job failed for %s: %s", symbol, e)
-        notify_key = (chat_id, symbol, tf)
-        last_sent = notify_cache.get(notify_key, 0.0)
-        throttle_sec = ALERT_ERROR_THROTTLE_MIN * 60
-        if now - last_sent >= throttle_sec:
-            try:
-                await app.bot.send_message(
-                    chat_id=chat_id,
-                    text=f"Alert {symbol}({tf_label}) временно не проверяется из-за ошибки API.",
-                )
-                notify_cache[notify_key] = now
-            except Exception:
-                logging.error("Failed to send alert error message to chat %s", chat_id)
-
-        next_backoff = max(ALERT_CHECK_SEC, backoff_sec * 2 if backoff_sec else ALERT_CHECK_SEC)
-        next_backoff = min(next_backoff, ALERT_MAX_BACKOFF_SEC)
-        if next_backoff != backoff_sec:
-            data["backoff_sec"] = next_backoff
-            data["next_retry_ts"] = now + next_backoff
-            try:
-                await app.bot.send_message(
-                    chat_id=chat_id,
-                    text=(
-                        f"⚠️ Ошибка при проверке алерта {symbol}({tf_label}). "
-                        f"Увеличиваю интервал проверки до {int(next_backoff // 60)} мин."
-                    ),
-                )
-            except Exception:
-                logging.error("Failed to send alert backoff message to chat %s", chat_id)
+            next_backoff = max(ALERT_CHECK_SEC, backoff_sec * 2 if backoff_sec else ALERT_CHECK_SEC)
+            next_backoff = min(next_backoff, ALERT_MAX_BACKOFF_SEC)
+            if next_backoff != backoff_sec:
+                data["backoff_sec"] = next_backoff
+                data["next_retry_ts"] = now + next_backoff
+                try:
+                    await app.bot.send_message(
+                        chat_id=chat_id,
+                        text=(
+                            f"⚠️ Ошибка при проверке алерта {symbol}({tf_label}). "
+                            f"Увеличиваю интервал проверки до {int(next_backoff // 60)} мин."
+                        ),
+                    )
+                except Exception:
+                    logging.error("Failed to send alert backoff message to chat %s", chat_id)
 
 
 async def cleanup_job(context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -3500,7 +3616,9 @@ async def post_init(app: Application):
     app.bot_data["tickers_lock"] = asyncio.Lock()
     app.bot_data["innovation_symbols_lock"] = asyncio.Lock()
     app.bot_data["http_sem"] = asyncio.Semaphore(MAX_CONCURRENCY)
+    app.bot_data["alert_sem"] = asyncio.Semaphore(ALERT_MAX_CONCURRENCY)
     app.bot_data["monitor_tasks"] = set()
+    app.bot_data["monitor_locks"] = {}
     app.bot_data["state"] = load_state()
     app.bot_data["state"].setdefault("pair_rsi_alerts", {})
     app.bot_data["state"].setdefault("price_alerts", {})
