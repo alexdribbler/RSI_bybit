@@ -14,7 +14,7 @@ from decimal import Decimal, InvalidOperation
 from dataclasses import dataclass
 from datetime import datetime
 from io import BytesIO
-from typing import Dict, List, Optional, Tuple, Set
+from typing import Callable, Dict, List, Optional, Tuple, Set
 from zoneinfo import ZoneInfo
 
 import aiohttp
@@ -48,7 +48,17 @@ BINANCE_FUTURES_BASE_URL = "https://fapi.binance.com"
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 
 RSI_PERIOD = 6
-STOCH_RSI_PERIOD = int(os.getenv("STOCH_RSI_PERIOD", "14"))
+STOCH_RSI_RSI_LEN = int(os.getenv("STOCH_RSI_RSI_LEN", "14"))
+STOCH_RSI_STOCH_LEN = int(os.getenv("STOCH_RSI_STOCH_LEN", "14"))
+STOCH_RSI_SMOOTH_K = int(os.getenv("STOCH_RSI_SMOOTH_K", "3"))
+STOCH_RSI_SMOOTH_D = int(os.getenv("STOCH_RSI_SMOOTH_D", "3"))
+STOCH_RSI_USE_CLOSED_CANDLE = os.getenv("STOCH_RSI_USE_CLOSED_CANDLE", "true").strip().lower() in {
+    "1",
+    "true",
+    "yes",
+    "y",
+    "on",
+}
 LEVERAGE = float(os.getenv("LEVERAGE", "20"))
 
 # Unified timeframe registry (label -> interval in minutes)
@@ -197,8 +207,14 @@ def validate_config() -> None:
         errors.append("KLINE_LIMIT must be > 0")
     if RSI_PERIOD <= 0:
         errors.append("RSI_PERIOD must be > 0")
-    if STOCH_RSI_PERIOD <= 0:
-        errors.append("STOCH_RSI_PERIOD must be > 0")
+    if STOCH_RSI_RSI_LEN <= 0:
+        errors.append("STOCH_RSI_RSI_LEN must be > 0")
+    if STOCH_RSI_STOCH_LEN <= 0:
+        errors.append("STOCH_RSI_STOCH_LEN must be > 0")
+    if STOCH_RSI_SMOOTH_K <= 0:
+        errors.append("STOCH_RSI_SMOOTH_K must be > 0")
+    if STOCH_RSI_SMOOTH_D <= 0:
+        errors.append("STOCH_RSI_SMOOTH_D must be > 0")
     if not (0 <= PAIR_RSI_LOW_THRESHOLD < PAIR_RSI_HIGH_THRESHOLD <= 100):
         errors.append("PAIR_RSI thresholds must be 0 <= low < high <= 100")
     if not (0 <= MONITOR_LONG_ALL_MAX <= 100):
@@ -1107,6 +1123,17 @@ async def get_kline_closes(
         except Exception:
             continue
     closes_with_ts.sort(key=lambda item: item[0])
+    if STOCH_RSI_USE_CLOSED_CANDLE and closes_with_ts:
+        try:
+            interval_minutes = int(interval)
+        except ValueError:
+            interval_minutes = 0
+        if interval_minutes > 0:
+            candle_ms = interval_minutes * 60 * 1000
+            now_ms = time.time() * 1000
+            last_ts = closes_with_ts[-1][0]
+            if now_ms < last_ts + candle_ms:
+                closes_with_ts.pop()
     closes = [value for _, value in closes_with_ts]
     return closes
 
@@ -1170,47 +1197,84 @@ def rsi_wilder_series(closes: List[float], period: int) -> List[float]:
     return rsi_values
 
 
-def stoch_rsi_from_closes(
+def sma_series(values: List[float], length: int) -> List[float]:
+    if length <= 0:
+        return []
+    if length == 1:
+        return list(values)
+    if len(values) < length:
+        return []
+    window_sum = sum(values[:length])
+    out = [window_sum / length]
+    for i in range(length, len(values)):
+        window_sum += values[i] - values[i - length]
+        out.append(window_sum / length)
+    return out
+
+
+def stoch_rsi_kd_from_closes(
     closes: List[float],
     rsi_period: int,
     stoch_period: int,
-) -> Optional[float]:
+    smooth_k: int,
+    smooth_d: int,
+) -> Optional[Tuple[float, float]]:
     rsi_values = rsi_wilder_series(closes, rsi_period)
     if len(rsi_values) < stoch_period:
         return None
-    window = rsi_values[-stoch_period:]
-    low = min(window)
-    high = max(window)
-    if high == low:
-        return 0.0
-    return (rsi_values[-1] - low) / (high - low) * 100.0
+
+    raw_values: List[float] = []
+    for i in range(stoch_period - 1, len(rsi_values)):
+        window = rsi_values[i - stoch_period + 1 : i + 1]
+        low = min(window)
+        high = max(window)
+        if high == low:
+            raw_values.append(0.0)
+        else:
+            raw_values.append((rsi_values[i] - low) / (high - low) * 100.0)
+
+    k_values = sma_series(raw_values, smooth_k)
+    if not k_values:
+        return None
+    d_values = sma_series(k_values, smooth_d)
+    if not d_values:
+        return None
+    return k_values[-1], d_values[-1]
 
 
-def is_long_candidate(rsis: Dict[str, float]) -> bool:
-    if any(val > MONITOR_LONG_ALL_MAX for val in rsis.values()):
-        return False
-    return (
-        rsis.get("5m", 101.0) <= MONITOR_LONG_FAST_MAX
-        and rsis.get("15m", 101.0) <= MONITOR_LONG_FAST_MAX
-    )
+def is_long_candidate(row: MonitorRow) -> bool:
+    return row.sum_rsi6 <= 100
 
 
-def is_short_candidate(rsis: Dict[str, float]) -> bool:
-    if any(val < MONITOR_SHORT_ALL_MIN for val in rsis.values()):
-        return False
-    return (
-        rsis.get("5m", -1.0) >= MONITOR_SHORT_FAST_MIN
-        and rsis.get("15m", -1.0) >= MONITOR_SHORT_FAST_MIN
-    )
+def is_short_candidate(row: MonitorRow) -> bool:
+    return row.sum_rsi6 >= 400
 
 
-async def compute_symbol_rsi_sum(
+@dataclass
+class MonitorRow:
+    symbol: str
+    sum_rsi6: float
+    sum_stoch: Optional[float]
+    rsi6: Dict[str, float]
+    stoch_k: Dict[str, float]
+    stoch_d: Dict[str, float]
+    macd: Dict[str, float]
+    dif: Dict[str, float]
+    dea: Dict[str, float]
+
+
+async def compute_symbol_indicators(
     session: aiohttp.ClientSession,
     rate_limiter: RateLimiter,
     sem: asyncio.Semaphore,
     symbol: str,
-) -> Optional[Tuple[str, float, Dict[str, float]]]:
+) -> Optional[MonitorRow]:
     rsis: Dict[str, float] = {}
+    stoch_k: Dict[str, float] = {}
+    stoch_d: Dict[str, float] = {}
+    macd_vals: Dict[str, float] = {}
+    dif_vals: Dict[str, float] = {}
+    dea_vals: Dict[str, float] = {}
 
     async def one_tf(tf_label: str, interval: str):
         async with sem:
@@ -1219,15 +1283,41 @@ async def compute_symbol_rsi_sum(
         if val is None:
             raise BybitAPIError(f"Not enough data for RSI{RSI_PERIOD} {symbol} {tf_label}")
         rsis[tf_label] = val
+        stoch_value = stoch_rsi_kd_from_closes(
+            closes,
+            STOCH_RSI_RSI_LEN,
+            STOCH_RSI_STOCH_LEN,
+            STOCH_RSI_SMOOTH_K,
+            STOCH_RSI_SMOOTH_D,
+        )
+        if stoch_value is not None:
+            stoch_k[tf_label], stoch_d[tf_label] = stoch_value
+        macd_value = macd_from_closes(closes)
+        if macd_value is not None:
+            macd, dif, dea = macd_value
+            macd_vals[tf_label] = macd
+            dif_vals[tf_label] = dif
+            dea_vals[tf_label] = dea
 
     try:
         await asyncio.gather(*(one_tf(lbl, iv) for (lbl, iv) in TIMEFRAMES))
     except Exception as e:
-        logging.warning("Failed to compute RSI for %s: %s", symbol, e)
+        logging.warning("Failed to compute indicators for %s: %s", symbol, e)
         return None
 
     s = sum(rsis[lbl] for (lbl, _) in TIMEFRAMES)
-    return symbol, s, rsis
+    sum_stoch = sum(stoch_k.values()) if stoch_k else None
+    return MonitorRow(
+        symbol=symbol,
+        sum_rsi6=s,
+        sum_stoch=sum_stoch,
+        rsi6=rsis,
+        stoch_k=stoch_k,
+        stoch_d=stoch_d,
+        macd=macd_vals,
+        dif=dif_vals,
+        dea=dea_vals,
+    )
 
 
 # =========================
@@ -1265,17 +1355,26 @@ async def get_stoch_rsi_values(
     rate_limiter: RateLimiter,
     symbol: str,
     sem: Optional[asyncio.Semaphore] = None,
-) -> Dict[str, float]:
-    async def one_tf(tf_label: str, interval: str) -> Tuple[str, float]:
+) -> Dict[str, Tuple[float, float]]:
+    async def one_tf(tf_label: str, interval: str) -> Tuple[str, Tuple[float, float]]:
         if sem is None:
             closes = await get_kline_closes(session, rate_limiter, symbol, interval, KLINE_LIMIT)
         else:
             async with sem:
                 closes = await get_kline_closes(session, rate_limiter, symbol, interval, KLINE_LIMIT)
-        value = stoch_rsi_from_closes(closes, RSI_PERIOD, STOCH_RSI_PERIOD)
+        value = stoch_rsi_kd_from_closes(
+            closes,
+            STOCH_RSI_RSI_LEN,
+            STOCH_RSI_STOCH_LEN,
+            STOCH_RSI_SMOOTH_K,
+            STOCH_RSI_SMOOTH_D,
+        )
         if value is None:
             raise BybitAPIError(
-                f"Not enough data for Stoch RSI ({RSI_PERIOD},{STOCH_RSI_PERIOD}) {symbol} {tf_label}"
+                "Not enough data for Stoch RSI "
+                f"({STOCH_RSI_RSI_LEN}/{STOCH_RSI_STOCH_LEN}/"
+                f"{STOCH_RSI_SMOOTH_K}/{STOCH_RSI_SMOOTH_D}) "
+                f"{symbol} {tf_label}"
             )
         return tf_label, value
 
@@ -1341,15 +1440,23 @@ def format_rsi_line_for_labels(values: Dict[str, float], labels: List[str]) -> s
     return f"RSI{RSI_PERIOD}: " + " | ".join(parts)
 
 
-def format_stoch_rsi_line(values: Dict[str, float]) -> str:
-    parts = []
+def format_stoch_rsi_line(values: Dict[str, Tuple[float, float]]) -> str:
+    k_parts = []
+    d_parts = []
     for label, _ in STOCH_RSI_TFS:
         value = values.get(label)
-        if value is None:
-            parts.append(f"{label} <code>n/a</code>")
-        else:
-            parts.append(f"{label} <code>{value:.2f}</code>")
-    return "Stoch RSI: " + " | ".join(parts)
+        if not value or len(value) != 2:
+            k_parts.append(f"{label} <code>n/a</code>")
+            d_parts.append(f"{label} <code>n/a</code>")
+            continue
+        k_val, d_val = value
+        if not (math.isfinite(k_val) and math.isfinite(d_val)):
+            k_parts.append(f"{label} <code>n/a</code>")
+            d_parts.append(f"{label} <code>n/a</code>")
+            continue
+        k_parts.append(f"{label} <code>{k_val:.2f}</code>")
+        d_parts.append(f"{label} <code>{d_val:.2f}</code>")
+    return "Stoch RSI(K): " + " | ".join(k_parts) + "\nStoch RSI(D): " + " | ".join(d_parts)
 
 
 def format_macd_lines(values: Dict[str, Tuple[float, float, float]]) -> Tuple[str, str, str]:
@@ -1437,20 +1544,13 @@ def measure_text(draw: ImageDraw.ImageDraw, text: str, font: ImageFont.FreeTypeF
     return bbox[2] - bbox[0], bbox[3] - bbox[1]
 
 
-def build_table_layout(
+def build_table_layout_generic(
     draw: ImageDraw.ImageDraw,
     font: ImageFont.FreeTypeFont,
-    rows: List[Tuple[str, float, Dict[str, float]]],
+    header_cells: List[str],
+    data_rows: List[List[str]],
     column_gap: int,
 ) -> Tuple[List[str], List[List[str]], List[int], int]:
-    header_cells = ["SYMBOL", "SUM"] + [lbl for (lbl, _) in TIMEFRAMES]
-    data_rows: List[List[str]] = []
-    for sym, s, rsis in rows:
-        row_cells = [sym, f"{s:.1f}"]
-        for (lbl, _) in TIMEFRAMES:
-            row_cells.append(f"{rsis[lbl]:.1f}")
-        data_rows.append(row_cells)
-
     col_count = len(header_cells)
     col_widths = [0] * col_count
     for col_idx, cell in enumerate(header_cells):
@@ -1466,14 +1566,14 @@ def build_table_layout(
 
 
 def render_png(
-    long_rows: List[Tuple[str, float, Dict[str, float]]],
-    short_rows: List[Tuple[str, float, Dict[str, float]]],
+    long_rows: List[MonitorRow],
+    short_rows: List[MonitorRow],
     symbols_scanned: int,
 ) -> BytesIO:
     ts = datetime.now(LOCAL_TZ).strftime("%Y-%m-%d %H:%M:%S %Z")
 
     header_lines = [
-        "Bybit USDT Perpetuals — RSI(6) sum monitor",
+        "Bybit USDT Perpetuals — RSI(6) + Stoch RSI(14/14/3/3) + MACD monitor",
         f"Timeframes: {', '.join(lbl for (lbl, _) in TIMEFRAMES)}",
         f"Generated: {ts}",
         f"Symbols scanned: {symbols_scanned} (top by turnover24h)",
@@ -1498,18 +1598,126 @@ def render_png(
 
     def add_table_block(
         title: str,
-        rows: List[Tuple[str, float, Dict[str, float]]],
+        header_cells: List[str],
+        data_rows: List[List[str]],
     ) -> None:
-        if rows:
-            blocks.append(("table", (title, rows)))
+        if data_rows:
+            blocks.append(("table", (title, header_cells, data_rows)))
         else:
             blocks.append(("text", title))
             blocks.append(("text", "No candidates found"))
 
-    add_table_block("TOP-10 LONG (min SUM RSI6)", long_rows)
+    tf_labels = [lbl for (lbl, _) in TIMEFRAMES]
+
+    def format_optional(value: Optional[float], fmt: str) -> str:
+        if value is None or not math.isfinite(value):
+            return "n/a"
+        return fmt.format(value)
+
+    def build_rsi_rows(rows: List[MonitorRow]) -> List[List[str]]:
+        data = []
+        for row in rows:
+            row_cells = [row.symbol, f"{row.sum_rsi6:.1f}"]
+            for lbl in tf_labels:
+                row_cells.append(format_optional(row.rsi6.get(lbl), "{:.1f}"))
+            data.append(row_cells)
+        return data
+
+    def build_stoch_rows(rows: List[MonitorRow]) -> List[List[str]]:
+        data = []
+        for row in rows:
+            sum_stoch = (
+                format_optional(row.sum_stoch, "{:.1f}") if row.sum_stoch is not None else "n/a"
+            )
+            row_cells = [row.symbol, sum_stoch]
+            for lbl in tf_labels:
+                k_val = row.stoch_k.get(lbl)
+                d_val = row.stoch_d.get(lbl)
+                if (
+                    k_val is None
+                    or d_val is None
+                    or not math.isfinite(k_val)
+                    or not math.isfinite(d_val)
+                ):
+                    row_cells.append("n/a")
+                else:
+                    row_cells.append(f"{k_val:.2f}/{d_val:.2f}")
+            data.append(row_cells)
+        return data
+
+    def build_simple_rows(
+        rows: List[MonitorRow],
+        accessor: Callable[[MonitorRow], Dict[str, float]],
+    ) -> List[List[str]]:
+        data = []
+        for row in rows:
+            row_cells = [row.symbol]
+            values = accessor(row)
+            for lbl in tf_labels:
+                row_cells.append(format_optional(values.get(lbl), "{:.6f}"))
+            data.append(row_cells)
+        return data
+
+    add_table_block(
+        "TOP-10 LONG (min SUM RSI6)",
+        ["SYMBOL", "SUM RSI6"] + tf_labels,
+        build_rsi_rows(long_rows),
+    )
+    blocks.append(("blank", None))
+    add_table_block(
+        "TOP-10 LONG (Stoch RSI 14/14/3/3 K/D)",
+        ["SYMBOL", "SUM Stoch"] + tf_labels,
+        build_stoch_rows(long_rows),
+    )
+    blocks.append(("blank", None))
+    add_table_block(
+        "TOP-10 LONG (MACD)",
+        ["SYMBOL"] + tf_labels,
+        build_simple_rows(long_rows, lambda row: row.macd),
+    )
+    blocks.append(("blank", None))
+    add_table_block(
+        "TOP-10 LONG (DIF)",
+        ["SYMBOL"] + tf_labels,
+        build_simple_rows(long_rows, lambda row: row.dif),
+    )
+    blocks.append(("blank", None))
+    add_table_block(
+        "TOP-10 LONG (DEA)",
+        ["SYMBOL"] + tf_labels,
+        build_simple_rows(long_rows, lambda row: row.dea),
+    )
     blocks.append(("blank", None))
     blocks.append(("blank", None))
-    add_table_block("TOP-10 SHORT (max SUM RSI6)", short_rows)
+    add_table_block(
+        "TOP-10 SHORT (max SUM RSI6)",
+        ["SYMBOL", "SUM RSI6"] + tf_labels,
+        build_rsi_rows(short_rows),
+    )
+    blocks.append(("blank", None))
+    add_table_block(
+        "TOP-10 SHORT (Stoch RSI 14/14/3/3 K/D)",
+        ["SYMBOL", "SUM Stoch"] + tf_labels,
+        build_stoch_rows(short_rows),
+    )
+    blocks.append(("blank", None))
+    add_table_block(
+        "TOP-10 SHORT (MACD)",
+        ["SYMBOL"] + tf_labels,
+        build_simple_rows(short_rows, lambda row: row.macd),
+    )
+    blocks.append(("blank", None))
+    add_table_block(
+        "TOP-10 SHORT (DIF)",
+        ["SYMBOL"] + tf_labels,
+        build_simple_rows(short_rows, lambda row: row.dif),
+    )
+    blocks.append(("blank", None))
+    add_table_block(
+        "TOP-10 SHORT (DEA)",
+        ["SYMBOL"] + tf_labels,
+        build_simple_rows(short_rows, lambda row: row.dea),
+    )
 
     max_w = 0
     total_h = IMAGE_PADDING * 2
@@ -1522,11 +1730,12 @@ def render_png(
         elif kind == "blank":
             total_h += row_step
         elif kind == "table":
-            title, rows = payload  # type: ignore[misc]
-            header_cells, data_rows, col_widths, table_w = build_table_layout(
+            title, header_cells, data_rows = payload  # type: ignore[misc]
+            header_cells, data_rows, col_widths, table_w = build_table_layout_generic(
                 d,
                 font,
-                rows,
+                header_cells,
+                data_rows,
                 column_gap,
             )
             table_layouts[idx] = (header_cells, data_rows, col_widths, table_w)
@@ -1547,7 +1756,7 @@ def render_png(
         elif kind == "blank":
             y += row_step
         elif kind == "table":
-            title, _ = payload  # type: ignore[misc]
+            title, _, _ = payload  # type: ignore[misc]
             header_cells, data_rows, col_widths, table_w = table_layouts[idx]
             d.text((IMAGE_PADDING, y), title, fill=(0, 0, 0), font=font)
             y += row_step
@@ -2648,9 +2857,15 @@ def build_pairs_text(long_syms: List[str], short_syms: List[str]) -> str:
     return "\n".join(lines)
 
 
-async def send_scan_result(app: Application, chat_id: int, long_rows, short_rows, symbols_scanned: int):
-    long_syms = [r[0] for r in long_rows]
-    short_syms = [r[0] for r in short_rows]
+async def send_scan_result(
+    app: Application,
+    chat_id: int,
+    long_rows: List[MonitorRow],
+    short_rows: List[MonitorRow],
+    symbols_scanned: int,
+):
+    long_syms = [r.symbol for r in long_rows]
+    short_syms = [r.symbol for r in short_rows]
 
     png = render_png(long_rows, short_rows, symbols_scanned=symbols_scanned)
     await app.bot.send_photo(chat_id=chat_id, photo=png)
@@ -2669,7 +2884,7 @@ async def run_monitor_once_internal(app: Application, chat_id: int, timeout_sec:
     sem: asyncio.Semaphore = app.bot_data["http_sem"]
     logging.debug("monitor_start chat_id=%s symbols=%d", chat_id, len(symbols))
 
-    results: List[Tuple[str, float, Dict[str, float]]] = []
+    results: List[MonitorRow] = []
     queue: asyncio.Queue[str] = asyncio.Queue()
     for symbol in symbols:
         queue.put_nowait(symbol)
@@ -2679,8 +2894,8 @@ async def run_monitor_once_internal(app: Application, chat_id: int, timeout_sec:
     success_count = 0
     error_count = 0
 
-    async def worker() -> Tuple[List[Tuple[str, float, Dict[str, float]]], int, int]:
-        local_results: List[Tuple[str, float, Dict[str, float]]] = []
+    async def worker() -> Tuple[List[MonitorRow], int, int]:
+        local_results: List[MonitorRow] = []
         local_success = 0
         local_error = 0
         while True:
@@ -2689,7 +2904,7 @@ async def run_monitor_once_internal(app: Application, chat_id: int, timeout_sec:
             except asyncio.QueueEmpty:
                 break
             try:
-                r = await compute_symbol_rsi_sum(session, rate_limiter, sem, symbol)
+                r = await compute_symbol_indicators(session, rate_limiter, sem, symbol)
                 if r is not None:
                     local_results.append(r)
                     local_success += 1
@@ -2773,11 +2988,11 @@ async def run_monitor_once_internal(app: Application, chat_id: int, timeout_sec:
         await app.bot.send_message(chat_id=chat_id, text="Не получилось собрать RSI (rate limit/временная ошибка).")
         return
 
-    long_candidates = [r for r in results if is_long_candidate(r[2])]
-    short_candidates = [r for r in results if is_short_candidate(r[2])]
+    long_candidates = [r for r in results if is_long_candidate(r)]
+    short_candidates = [r for r in results if is_short_candidate(r)]
 
-    long_candidates.sort(key=lambda x: x[1])
-    short_candidates.sort(key=lambda x: x[1], reverse=True)
+    long_candidates.sort(key=lambda x: x.sum_rsi6)
+    short_candidates.sort(key=lambda x: x.sum_rsi6, reverse=True)
 
     long_rows = long_candidates[:10]
     short_rows = short_candidates[:10]
@@ -3642,27 +3857,30 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         try:
             price = await get_last_price(session, rate_limiter, symbol)
+            sem: asyncio.Semaphore = app.bot_data["http_sem"]
             try:
-                sem: asyncio.Semaphore = app.bot_data["http_sem"]
                 stoch_values = await get_stoch_rsi_values(session, rate_limiter, symbol, sem)
             except Exception as e:
                 logging.warning("Failed to compute Stoch RSI for %s: %s", symbol, e)
                 stoch_values = {}
             stoch_line = format_stoch_rsi_line(stoch_values)
 
-            if side == "L":
-                msg = (
-                    f"<b>{symbol} — LONG</b>\n"
-                    f"Current: <code>{price:.6f}</code>\n\n"
-                    f"{stoch_line}\n"
-                )
+            try:
+                macd_values = await get_macd_values(session, rate_limiter, sem, symbol)
+            except Exception as e:
+                logging.warning("Failed to compute MACD for %s: %s", symbol, e)
+                macd_values = {}
+            macd_line, dif_line, dea_line = format_macd_lines(macd_values)
 
-            else:
-                msg = (
-                    f"<b>{symbol} — SHORT</b>\n"
-                    f"Current: <code>{price:.6f}</code>\n\n"
-                    f"{stoch_line}\n"
-                )
+            direction_label = "LONG" if side == "L" else "SHORT"
+            msg = (
+                f"<b>{symbol} — {direction_label}</b>\n"
+                f"Current: <code>{price:.6f}</code>\n\n"
+                f"{stoch_line}\n\n"
+                f"{macd_line}\n"
+                f"{dif_line}\n"
+                f"{dea_line}\n"
+            )
 
             await app.bot.send_message(
                 chat_id=chat_id,
