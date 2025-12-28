@@ -21,6 +21,8 @@ from dotenv import load_dotenv
 from PIL import Image, ImageDraw, ImageFont
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram.error import NetworkError, TimedOut
+from telegram.request import HTTPXRequest
 from telegram.ext import (
     Application,
     ApplicationBuilder,
@@ -3010,6 +3012,7 @@ async def pair_rsi_alert_job_callback(context: ContextTypes.DEFAULT_TYPE):
 # =========================
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
+    logging.info("CMD /start from chat_id=%s", chat_id)
     app = context.application
 
     sub = await get_sub(app, chat_id)
@@ -3700,13 +3703,29 @@ async def post_shutdown(app: Application):
 def main():
     validate_config()
 
+    tg_request = HTTPXRequest(
+        connect_timeout=30,
+        read_timeout=30,
+        write_timeout=30,
+        pool_timeout=30,
+    )
+
     app = (
         ApplicationBuilder()
         .token(TELEGRAM_BOT_TOKEN)
+        .request(tg_request)
         .post_init(post_init)
         .post_shutdown(post_shutdown)
         .build()
     )
+
+    async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+        if isinstance(context.error, (TimedOut, NetworkError)):
+            logging.warning("Telegram network error while processing update=%r", update, exc_info=context.error)
+            return
+        logging.exception("Unhandled error while processing update=%r", update, exc_info=context.error)
+
+    app.add_error_handler(error_handler)
 
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CallbackQueryHandler(on_callback))
