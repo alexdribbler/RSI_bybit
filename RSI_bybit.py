@@ -315,6 +315,10 @@ def save_perp_symbols(symbols: Set[str]) -> None:
 async def persist_state(app: Application, state: dict) -> None:
     save_event: asyncio.Event = app.bot_data["state_save_event"]
     save_done: asyncio.Event = app.bot_data["state_save_done"]
+    seq_lock: asyncio.Lock = app.bot_data["state_save_seq_lock"]
+    async with seq_lock:
+        app.bot_data["state_save_seq"] += 1
+        app.bot_data["state_save_last_requested_seq"] = app.bot_data["state_save_seq"]
     save_done.clear()
     save_event.set()
     save_task: Optional[asyncio.Task] = app.bot_data.get("state_save_task")
@@ -326,9 +330,12 @@ async def state_save_worker(app: Application) -> None:
     try:
         save_event: asyncio.Event = app.bot_data["state_save_event"]
         save_done: asyncio.Event = app.bot_data["state_save_done"]
+        seq_lock: asyncio.Lock = app.bot_data["state_save_seq_lock"]
         while True:
             await save_event.wait()
             save_event.clear()
+            async with seq_lock:
+                seq_before = app.bot_data["state_save_seq"]
             state_lock: asyncio.Lock = app.bot_data["state_lock"]
             async with state_lock:
                 snapshot = copy.deepcopy(
@@ -345,7 +352,9 @@ async def state_save_worker(app: Application) -> None:
             write_lock: asyncio.Lock = app.bot_data["state_write_lock"]
             async with write_lock:
                 save_state_json(state_json)
-            if not save_event.is_set():
+            async with seq_lock:
+                seq_after = app.bot_data["state_save_seq"]
+            if seq_after == seq_before:
                 save_done.set()
     except asyncio.CancelledError:
         raise
@@ -1250,24 +1259,37 @@ def load_monospace_font(size: int) -> ImageFont.FreeTypeFont:
     return ImageFont.load_default()
 
 
-def format_table_lines(title: str, rows: List[Tuple[str, float, Dict[str, float]]]) -> List[str]:
-    """Format table lines for rendering. Returns empty list if no rows."""
-    if not rows:
-        return []
-    
-    sym_w = 16
-    num_w = 6
+def measure_text(draw: ImageDraw.ImageDraw, text: str, font: ImageFont.FreeTypeFont) -> Tuple[int, int]:
+    bbox = draw.textbbox((0, 0), text, font=font)
+    return bbox[2] - bbox[0], bbox[3] - bbox[1]
 
-    header_cols = ["SUM"] + [lbl for (lbl, _) in TIMEFRAMES]
-    header = f"{'SYMBOL'.ljust(sym_w)} " + " ".join(c.rjust(num_w) for c in header_cols)
 
-    lines = [title, header, "-" * len(header)]
+def build_table_layout(
+    draw: ImageDraw.ImageDraw,
+    font: ImageFont.FreeTypeFont,
+    rows: List[Tuple[str, float, Dict[str, float]]],
+    column_gap: int,
+) -> Tuple[List[str], List[List[str]], List[int], int]:
+    header_cells = ["SYMBOL", "SUM"] + [lbl for (lbl, _) in TIMEFRAMES]
+    data_rows: List[List[str]] = []
     for sym, s, rsis in rows:
-        parts = [f"{s:>{num_w}.1f}"]
+        row_cells = [sym, f"{s:.1f}"]
         for (lbl, _) in TIMEFRAMES:
-            parts.append(f"{rsis[lbl]:>{num_w}.1f}")
-        lines.append(f"{sym.ljust(sym_w)} " + " ".join(parts))
-    return lines
+            row_cells.append(f"{rsis[lbl]:.1f}")
+        data_rows.append(row_cells)
+
+    col_count = len(header_cells)
+    col_widths = [0] * col_count
+    for col_idx, cell in enumerate(header_cells):
+        width, _ = measure_text(draw, cell, font)
+        col_widths[col_idx] = max(col_widths[col_idx], width)
+    for row in data_rows:
+        for col_idx, cell in enumerate(row):
+            width, _ = measure_text(draw, cell, font)
+            col_widths[col_idx] = max(col_widths[col_idx], width)
+
+    total_width = sum(col_widths) + column_gap * (col_count - 1 if col_count > 0 else 0)
+    return header_cells, data_rows, col_widths, total_width
 
 
 def render_png(
@@ -1277,55 +1299,105 @@ def render_png(
 ) -> BytesIO:
     ts = datetime.now(LOCAL_TZ).strftime("%Y-%m-%d %H:%M:%S %Z")
 
-    lines: List[str] = []
-    lines += [
+    header_lines = [
         "Bybit USDT Perpetuals — RSI(6) sum monitor",
         f"Timeframes: {', '.join(lbl for (lbl, _) in TIMEFRAMES)}",
         f"Generated: {ts}",
         f"Symbols scanned: {symbols_scanned} (top by turnover24h)",
         "",
     ]
-    
-    # Format LONG table
-    long_lines = format_table_lines("TOP-10 LONG (min SUM RSI6)", long_rows)
-    if long_lines:
-        lines += long_lines
-    else:
-        lines += ["TOP-10 LONG (min SUM RSI6)", "No candidates found"]
-    
-    lines += ["", ""]
-    
-    # Format SHORT table
-    short_lines = format_table_lines("TOP-10 SHORT (max SUM RSI6)", short_rows)
-    if short_lines:
-        lines += short_lines
-    else:
-        lines += ["TOP-10 SHORT (max SUM RSI6)", "No candidates found"]
 
     font = load_monospace_font(FONT_SIZE)
 
     dummy = Image.new("RGB", (10, 10), (255, 255, 255))
     d = ImageDraw.Draw(dummy)
 
-    max_w = 0
-    line_h = 0
-    for line in lines:
-        bbox = d.textbbox((0, 0), line, font=font)
-        w = bbox[2] - bbox[0]
-        h = bbox[3] - bbox[1]
-        max_w = max(max_w, w)
-        line_h = max(line_h, h)
+    _, line_h = measure_text(d, "Hg", font)
+    row_step = line_h + LINE_SPACING
+    column_gap = 12
 
-    total_h = IMAGE_PADDING * 2 + len(lines) * (line_h + LINE_SPACING) - LINE_SPACING
+    blocks: List[Tuple[str, object]] = []
+    for line in header_lines:
+        if line:
+            blocks.append(("text", line))
+        else:
+            blocks.append(("blank", None))
+
+    def add_table_block(
+        title: str,
+        rows: List[Tuple[str, float, Dict[str, float]]],
+    ) -> None:
+        if rows:
+            blocks.append(("table", (title, rows)))
+        else:
+            blocks.append(("text", title))
+            blocks.append(("text", "No candidates found"))
+
+    add_table_block("TOP-10 LONG (min SUM RSI6)", long_rows)
+    blocks.append(("blank", None))
+    blocks.append(("blank", None))
+    add_table_block("TOP-10 SHORT (max SUM RSI6)", short_rows)
+
+    max_w = 0
+    total_h = IMAGE_PADDING * 2
+    table_layouts: Dict[int, Tuple[List[str], List[List[str]], List[int], int]] = {}
+    for idx, (kind, payload) in enumerate(blocks):
+        if kind == "text":
+            w, _ = measure_text(d, str(payload), font)
+            max_w = max(max_w, w)
+            total_h += row_step
+        elif kind == "blank":
+            total_h += row_step
+        elif kind == "table":
+            title, rows = payload  # type: ignore[misc]
+            header_cells, data_rows, col_widths, table_w = build_table_layout(
+                d,
+                font,
+                rows,
+                column_gap,
+            )
+            table_layouts[idx] = (header_cells, data_rows, col_widths, table_w)
+            title_w, _ = measure_text(d, title, font)
+            max_w = max(max_w, title_w, table_w)
+            total_h += row_step * (3 + len(data_rows))
+
     total_w = IMAGE_PADDING * 2 + max_w
 
     img = Image.new("RGB", (total_w, total_h), (255, 255, 255))
     d = ImageDraw.Draw(img)
 
     y = IMAGE_PADDING
-    for line in lines:
-        d.text((IMAGE_PADDING, y), line, fill=(0, 0, 0), font=font)
-        y += line_h + LINE_SPACING
+    for idx, (kind, payload) in enumerate(blocks):
+        if kind == "text":
+            d.text((IMAGE_PADDING, y), str(payload), fill=(0, 0, 0), font=font)
+            y += row_step
+        elif kind == "blank":
+            y += row_step
+        elif kind == "table":
+            title, _ = payload  # type: ignore[misc]
+            header_cells, data_rows, col_widths, table_w = table_layouts[idx]
+            d.text((IMAGE_PADDING, y), title, fill=(0, 0, 0), font=font)
+            y += row_step
+            x = IMAGE_PADDING
+            col_positions = [x]
+            for width in col_widths[:-1]:
+                x += width + column_gap
+                col_positions.append(x)
+            for col_idx, cell in enumerate(header_cells):
+                d.text((col_positions[col_idx], y), cell, fill=(0, 0, 0), font=font)
+            y += row_step
+            line_y = y + line_h // 2
+            d.line((IMAGE_PADDING, line_y, IMAGE_PADDING + table_w, line_y), fill=(0, 0, 0))
+            y += row_step
+            for row in data_rows:
+                for col_idx, cell in enumerate(row):
+                    cell_w, _ = measure_text(d, cell, font)
+                    if col_idx == 0:
+                        cell_x = col_positions[col_idx]
+                    else:
+                        cell_x = col_positions[col_idx] + col_widths[col_idx] - cell_w
+                    d.text((cell_x, y), cell, fill=(0, 0, 0), font=font)
+                y += row_step
 
     bio = BytesIO()
     bio.name = "rsi_tables.png"
@@ -2177,6 +2249,8 @@ async def restore_alerts(app: Application) -> None:
             log_state_change(state, "restore_alerts_prune")
             await persist_state(app, state)
 
+    valid_symbols = await get_valid_symbols_with_fallback(app)
+
     for chat_id_str, amap in alerts_all.items():
         try:
             chat_id = int(chat_id_str)
@@ -2192,8 +2266,29 @@ async def restore_alerts(app: Application) -> None:
                 tf = a.get("tf")
                 tf_label = a.get("tf_label") or f"{tf}m"
                 side = a.get("side")
-                if symbol and tf and side:
-                    await schedule_alert(app, chat_id, symbol, tf, tf_label, side)
+                if not symbol or not tf or not side:
+                    continue
+                if tf not in ALERT_INTERVALS or side not in {"L", "S"}:
+                    continue
+                if valid_symbols and not validate_symbol(symbol, valid_symbols):
+                    unschedule_alert(app, chat_id, symbol, tf)
+                    await delete_alert_state(
+                        app,
+                        chat_id,
+                        symbol,
+                        tf,
+                        validate_symbol_check=False,
+                    )
+                    continue
+                await schedule_alert(
+                    app,
+                    chat_id,
+                    symbol,
+                    tf,
+                    tf_label,
+                    side,
+                    valid_symbols=valid_symbols,
+                )
             except Exception as e:
                 logging.warning("Failed restoring alert: %s", e)
 
@@ -2346,18 +2441,17 @@ async def run_monitor_once_internal(app: Application, chat_id: int, timeout_sec:
     timed_out = False
     try:
         if tasks:
-            try:
-                for done in asyncio.as_completed(tasks, timeout=timeout_sec):
-                    local_results, local_success, local_error = await done
-                    results.extend(local_results)
-                    success_count += local_success
-                    error_count += local_error
-            except asyncio.TimeoutError:
+            done, pending = await asyncio.wait(tasks, timeout=timeout_sec)
+            if pending:
                 timed_out = True
-    finally:
-        for task in tasks:
-            if timed_out and not task.done():
+            for task in done:
+                local_results, local_success, local_error = await task
+                results.extend(local_results)
+                success_count += local_success
+                error_count += local_error
+            for task in pending:
                 task.cancel()
+    finally:
         if tasks:
             gather_task = asyncio.gather(*tasks, return_exceptions=True)
             try:
@@ -3366,6 +3460,9 @@ async def post_init(app: Application):
     app.bot_data["state_save_event"] = asyncio.Event()
     app.bot_data["state_save_done"] = asyncio.Event()
     app.bot_data["state_save_done"].set()
+    app.bot_data["state_save_seq"] = 0
+    app.bot_data["state_save_last_requested_seq"] = 0
+    app.bot_data["state_save_seq_lock"] = asyncio.Lock()
     app.bot_data["state_save_task"] = asyncio.create_task(state_save_worker(app))
     app.bot_data["perp_symbols_lock"] = asyncio.Lock()
     app.bot_data["tickers_lock"] = asyncio.Lock()
