@@ -596,7 +596,7 @@ def parse_price_input(raw: str) -> Optional[Decimal]:
         return None
     try:
         value = Decimal(cleaned)
-    except InvalidOperation:
+    except (InvalidOperation, ValueError):
         return None
     if not value.is_finite() or value <= 0:
         return None
@@ -2052,7 +2052,7 @@ def prune_ttl_dict(cache: Dict[object, float], ttl_sec: float, now: float) -> No
             del cache[key]
 
 
-def prune_expired_alerts(state: dict, now: Optional[float] = None) -> bool:
+def _prune_expired_alerts_unsafe(state: dict, now: Optional[float] = None) -> bool:
     if now is None:
         now = time.time()
     changed = False
@@ -2116,7 +2116,7 @@ async def set_alert_state(
             "price_alerts": {},
         }
         now = time.time()
-        changed = prune_expired_alerts(state, now=now)
+        changed = _prune_expired_alerts_unsafe(state, now=now)
         alerts_all = state.setdefault("alerts", {})
         alerts = alerts_all.setdefault(str(chat_id), {})
         key = f"{symbol}|{tf}"
@@ -2278,23 +2278,47 @@ async def get_innovation_zone_symbols(
         cached = app.bot_data.get("innovation_symbols_cache")
         if cached and (now - cached.ts) <= INNOVATION_SYMBOLS_CACHE_TTL:
             return cached.value  # type: ignore
+        refresh_task = app.bot_data.get("innovation_symbols_refresh_task")
+        if refresh_task and not refresh_task.done():
+            task = refresh_task
+        else:
+            task = asyncio.create_task(
+                _refresh_innovation_zone_symbols(app, session, rate_limiter)
+            )
+            app.bot_data["innovation_symbols_refresh_task"] = task
 
-        url = f"{BYBIT_BASE_URL}/v5/market/fee-group-info"
-        params = {"productType": "contract", "groupId": "6"}
-        symbols: Set[str] = set()
-        try:
-            payload = await api_get_json(session, url, params, rate_limiter)
-            items = (payload.get("result") or {}).get("list") or []
-            for item in items:
-                for symbol in item.get("symbols") or []:
-                    if isinstance(symbol, str):
-                        symbols.add(symbol)
-        except Exception as e:
-            logging.warning("Failed to fetch Innovation Zone symbols: %s", e)
-            symbols = set()
+    try:
+        return await task
+    finally:
+        if task.done():
+            async with cache_lock:
+                if app.bot_data.get("innovation_symbols_refresh_task") is task:
+                    app.bot_data["innovation_symbols_refresh_task"] = None
 
-        app.bot_data["innovation_symbols_cache"] = CacheItem(ts=now, value=symbols)
-        return symbols
+
+async def _refresh_innovation_zone_symbols(
+    app: Application,
+    session: aiohttp.ClientSession,
+    rate_limiter: RateLimiter,
+) -> Set[str]:
+    url = f"{BYBIT_BASE_URL}/v5/market/fee-group-info"
+    params = {"productType": "contract", "groupId": "6"}
+    symbols: Set[str] = set()
+    try:
+        payload = await api_get_json(session, url, params, rate_limiter)
+        items = (payload.get("result") or {}).get("list") or []
+        for item in items:
+            for symbol in item.get("symbols") or []:
+                if isinstance(symbol, str):
+                    symbols.add(symbol)
+    except Exception as e:
+        logging.warning("Failed to fetch Innovation Zone symbols: %s", e)
+        symbols = set()
+
+    cache_lock: asyncio.Lock = app.bot_data["innovation_symbols_lock"]
+    async with cache_lock:
+        app.bot_data["innovation_symbols_cache"] = CacheItem(ts=time.time(), value=symbols)
+    return symbols
 
 
 async def get_cached_perp_symbols(app: Application) -> Set[str]:
@@ -2488,7 +2512,7 @@ async def restore_alerts(app: Application) -> None:
             "pair_rsi_alerts": {},
             "price_alerts": {},
         }
-        changed = prune_expired_alerts(state)
+        changed = _prune_expired_alerts_unsafe(state)
         alerts_all = copy.deepcopy(state.get("alerts", {}) or {})
         if changed:
             app.bot_data["state"] = state
@@ -2673,6 +2697,7 @@ async def run_monitor_once_internal(app: Application, chat_id: int, timeout_sec:
                     local_error += 1
             except asyncio.CancelledError:
                 logging.warning("Task cancelled during monitor scan")
+                queue.put_nowait(symbol)
                 raise
             except Exception as e:
                 logging.warning("Failed to compute RSI for %s: %s", symbol, e)
@@ -2990,7 +3015,7 @@ async def cleanup_job(context: ContextTypes.DEFAULT_TYPE) -> None:
             "pair_rsi_alerts": {},
             "price_alerts": {},
         }
-        changed = prune_expired_alerts(state, now=now)
+        changed = _prune_expired_alerts_unsafe(state, now=now)
         if changed:
             app.bot_data["state"] = state
             await persist_state(app, state)
@@ -3761,6 +3786,7 @@ async def post_init(app: Application):
             app.bot_data["perp_symbols_cache"] = CacheItem(ts=0.0, value=cached_symbols)
         app.bot_data["tickers_cache"] = None
         app.bot_data["innovation_symbols_cache"] = None
+        app.bot_data["innovation_symbols_refresh_task"] = None
         app.bot_data["alert_cooldowns"] = {}
         app.bot_data["alert_error_notify"] = {}
         app.job_queue.run_repeating(cleanup_job, interval=CLEANUP_INTERVAL_SEC, first=CLEANUP_INTERVAL_SEC)
@@ -3799,7 +3825,7 @@ async def post_init(app: Application):
         if session:
             with contextlib.suppress(Exception):
                 await session.close()
-        app.bot_data["http_session"] = None
+        app.bot_data["http_session"] = aiohttp.ClientSession()
         app.bot_data["rate_limiter"] = RateLimiter()
         app.bot_data["state_lock"] = asyncio.Lock()
         app.bot_data["state_write_lock"] = asyncio.Lock()
@@ -3823,11 +3849,14 @@ async def post_init(app: Application):
         app.bot_data["perp_symbols_cache"] = None
         app.bot_data["tickers_cache"] = None
         app.bot_data["innovation_symbols_cache"] = None
+        app.bot_data["innovation_symbols_refresh_task"] = None
         app.bot_data["alert_cooldowns"] = {}
         app.bot_data["alert_error_notify"] = {}
 
 
 async def post_shutdown(app: Application):
+    global BINANCE_SYMBOLS_CACHE
+    global BINANCE_SYMBOLS_CACHE_LOCK
     monitor_tasks: Set[asyncio.Task] = app.bot_data.get("monitor_tasks", set())
     for task in list(monitor_tasks):
         if not task.done():
@@ -3844,6 +3873,7 @@ async def post_shutdown(app: Application):
     sess: aiohttp.ClientSession = app.bot_data.get("http_session")
     if sess:
         await sess.close()
+    BINANCE_SYMBOLS_CACHE = None
     await flush_state(app)
 
 
