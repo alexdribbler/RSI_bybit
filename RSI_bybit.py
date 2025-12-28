@@ -6,6 +6,7 @@ import json
 import logging
 import os
 import random
+import sys
 from math import ceil
 import time
 import math
@@ -21,7 +22,7 @@ from dotenv import load_dotenv
 from PIL import Image, ImageDraw, ImageFont
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
-from telegram.error import NetworkError, TimedOut
+from telegram.error import BadRequest, Forbidden, NetworkError, TimedOut
 from telegram.request import HTTPXRequest
 from telegram.ext import (
     Application,
@@ -3013,8 +3014,12 @@ async def pair_rsi_alert_job_callback(context: ContextTypes.DEFAULT_TYPE):
 # CALLBACK HANDLERS
 # =========================
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    logging.info("=== /start received. update_id=%s ===", getattr(update, "update_id", None))
+    if not update.effective_chat or not update.message:
+        logging.warning("cmd_start: no chat/message in update=%r", update)
+        return
     chat_id = update.effective_chat.id
-    logging.info("CMD /start from chat_id=%s", chat_id)
+    logging.info("cmd_start: chat_id=%s", chat_id)
     app = context.application
 
     sub = await get_sub(app, chat_id)
@@ -3028,9 +3033,12 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• Кнопка «Информация по паре» — вручную введи символ и получи RSI/Stoch RSI\n"
     )
     await update.message.reply_text(text, reply_markup=main_menu_kb(has_sub))
+    logging.info("cmd_start: replied to chat_id=%s", chat_id)
 
 
 async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.effective_chat or not update.message:
+        return
     chat_id = update.effective_chat.id
     app = context.application
 
@@ -3209,6 +3217,8 @@ async def apply_price_alert(
 
 async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
+    if not query or not query.message or not update.effective_chat:
+        return
     await query.answer()
 
     chat_id = query.message.chat_id
@@ -3618,65 +3628,98 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # INIT / SHUTDOWN
 # =========================
 async def post_init(app: Application):
-    app.bot_data["http_session"] = aiohttp.ClientSession()
-    app.bot_data["rate_limiter"] = RateLimiter()
-    app.bot_data["state_lock"] = asyncio.Lock()
-    app.bot_data["state_write_lock"] = asyncio.Lock()
-    app.bot_data["state_save_event"] = asyncio.Event()
-    app.bot_data["state_save_done"] = asyncio.Event()
-    app.bot_data["state_save_done"].set()
-    app.bot_data["state_save_seq"] = 0
-    app.bot_data["state_save_last_requested_seq"] = 0
-    app.bot_data["state_save_seq_lock"] = asyncio.Lock()
-    app.bot_data["state_save_task"] = asyncio.create_task(state_save_worker(app))
-    app.bot_data["perp_symbols_lock"] = asyncio.Lock()
-    app.bot_data["tickers_lock"] = asyncio.Lock()
-    app.bot_data["innovation_symbols_lock"] = asyncio.Lock()
-    app.bot_data["http_sem"] = asyncio.Semaphore(MAX_CONCURRENCY)
-    app.bot_data["alert_sem"] = asyncio.Semaphore(ALERT_MAX_CONCURRENCY)
-    app.bot_data["monitor_tasks"] = set()
-    app.bot_data["monitor_locks"] = {}
-    app.bot_data["state"] = load_state()
-    app.bot_data["state"].setdefault("pair_rsi_alerts", {})
-    app.bot_data["state"].setdefault("price_alerts", {})
-    app.bot_data["perp_symbols_cache"] = None
-    cached_symbols = load_perp_symbols()
-    if cached_symbols:
-        app.bot_data["perp_symbols_cache"] = CacheItem(ts=0.0, value=cached_symbols)
-    app.bot_data["tickers_cache"] = None
-    app.bot_data["innovation_symbols_cache"] = None
-    app.bot_data["alert_cooldowns"] = {}
-    app.bot_data["alert_error_notify"] = {}
-    app.job_queue.run_repeating(cleanup_job, interval=CLEANUP_INTERVAL_SEC, first=CLEANUP_INTERVAL_SEC)
+    try:
+        app.bot_data["http_session"] = aiohttp.ClientSession()
+        app.bot_data["rate_limiter"] = RateLimiter()
+        app.bot_data["state_lock"] = asyncio.Lock()
+        app.bot_data["state_write_lock"] = asyncio.Lock()
+        app.bot_data["state_save_event"] = asyncio.Event()
+        app.bot_data["state_save_done"] = asyncio.Event()
+        app.bot_data["state_save_done"].set()
+        app.bot_data["state_save_seq"] = 0
+        app.bot_data["state_save_last_requested_seq"] = 0
+        app.bot_data["state_save_seq_lock"] = asyncio.Lock()
+        app.bot_data["state_save_task"] = asyncio.create_task(state_save_worker(app))
+        app.bot_data["perp_symbols_lock"] = asyncio.Lock()
+        app.bot_data["tickers_lock"] = asyncio.Lock()
+        app.bot_data["innovation_symbols_lock"] = asyncio.Lock()
+        app.bot_data["http_sem"] = asyncio.Semaphore(MAX_CONCURRENCY)
+        app.bot_data["alert_sem"] = asyncio.Semaphore(ALERT_MAX_CONCURRENCY)
+        app.bot_data["monitor_tasks"] = set()
+        app.bot_data["monitor_locks"] = {}
+        app.bot_data["state"] = load_state()
+        app.bot_data["state"].setdefault("pair_rsi_alerts", {})
+        app.bot_data["state"].setdefault("price_alerts", {})
+        app.bot_data["perp_symbols_cache"] = None
+        cached_symbols = load_perp_symbols()
+        if cached_symbols:
+            app.bot_data["perp_symbols_cache"] = CacheItem(ts=0.0, value=cached_symbols)
+        app.bot_data["tickers_cache"] = None
+        app.bot_data["innovation_symbols_cache"] = None
+        app.bot_data["alert_cooldowns"] = {}
+        app.bot_data["alert_error_notify"] = {}
+        app.job_queue.run_repeating(cleanup_job, interval=CLEANUP_INTERVAL_SEC, first=CLEANUP_INTERVAL_SEC)
 
-    # restore subscriptions with proper validation
-    subs: dict = (app.bot_data["state"] or {}).get("subs", {})
-    for chat_id_str, sub in subs.items():
-        try:
-            if not sub.get("enabled", False):
-                continue
-            interval_min = int(sub.get("interval_min", 0))
-            chat_id = int(chat_id_str)
-            
-            # Validate both chat_id and interval
-            if not validate_chat_id(chat_id) or not validate_interval(interval_min):
-                logging.warning("Skipping invalid subscription: chat_id=%s, interval=%s", chat_id, interval_min)
-                continue
-            
-            schedule_subscription(app, chat_id, interval_min)
-            logging.info("Restored subscription chat_id=%s interval=%s", chat_id, interval_min)
-        except Exception as e:
-            logging.warning("Failed to restore sub %s: %s", chat_id_str, e)
+        # restore subscriptions with proper validation
+        subs: dict = (app.bot_data["state"] or {}).get("subs", {})
+        for chat_id_str, sub in subs.items():
+            try:
+                if not sub.get("enabled", False):
+                    continue
+                interval_min = int(sub.get("interval_min", 0))
+                chat_id = int(chat_id_str)
 
-    # restore alerts
-    await restore_alerts(app)
-    logging.info("Restored alerts")
+                # Validate both chat_id and interval
+                if not validate_chat_id(chat_id) or not validate_interval(interval_min):
+                    logging.warning("Skipping invalid subscription: chat_id=%s, interval=%s", chat_id, interval_min)
+                    continue
 
-    await restore_pair_rsi_alerts(app)
-    logging.info("Restored pair RSI alerts")
+                schedule_subscription(app, chat_id, interval_min)
+                logging.info("Restored subscription chat_id=%s interval=%s", chat_id, interval_min)
+            except Exception as e:
+                logging.warning("Failed to restore sub %s: %s", chat_id_str, e)
 
-    await restore_price_alerts(app)
-    logging.info("Restored price alerts")
+        # restore alerts
+        await restore_alerts(app)
+        logging.info("Restored alerts")
+
+        await restore_pair_rsi_alerts(app)
+        logging.info("Restored pair RSI alerts")
+
+        await restore_price_alerts(app)
+        logging.info("Restored price alerts")
+    except Exception as e:
+        logging.exception("post_init failed; applying safe defaults", exc_info=e)
+        session = app.bot_data.get("http_session")
+        if session:
+            with contextlib.suppress(Exception):
+                await session.close()
+        app.bot_data["http_session"] = None
+        app.bot_data["rate_limiter"] = RateLimiter()
+        app.bot_data["state_lock"] = asyncio.Lock()
+        app.bot_data["state_write_lock"] = asyncio.Lock()
+        app.bot_data["state_save_event"] = asyncio.Event()
+        app.bot_data["state_save_done"] = asyncio.Event()
+        app.bot_data["state_save_done"].set()
+        app.bot_data["state_save_seq"] = 0
+        app.bot_data["state_save_last_requested_seq"] = 0
+        app.bot_data["state_save_seq_lock"] = asyncio.Lock()
+        app.bot_data["state_save_task"] = None
+        app.bot_data["perp_symbols_lock"] = asyncio.Lock()
+        app.bot_data["tickers_lock"] = asyncio.Lock()
+        app.bot_data["innovation_symbols_lock"] = asyncio.Lock()
+        app.bot_data["http_sem"] = asyncio.Semaphore(MAX_CONCURRENCY)
+        app.bot_data["alert_sem"] = asyncio.Semaphore(ALERT_MAX_CONCURRENCY)
+        app.bot_data["monitor_tasks"] = set()
+        app.bot_data["monitor_locks"] = {}
+        app.bot_data["state"] = load_state()
+        app.bot_data["state"].setdefault("pair_rsi_alerts", {})
+        app.bot_data["state"].setdefault("price_alerts", {})
+        app.bot_data["perp_symbols_cache"] = None
+        app.bot_data["tickers_cache"] = None
+        app.bot_data["innovation_symbols_cache"] = None
+        app.bot_data["alert_cooldowns"] = {}
+        app.bot_data["alert_error_notify"] = {}
 
 
 async def post_shutdown(app: Application):
@@ -3703,7 +3746,11 @@ async def post_shutdown(app: Application):
 # MAIN
 # =========================
 def main():
-    validate_config()
+    try:
+        validate_config()
+    except Exception as e:
+        logging.error("Config validation failed: %s", e)
+        sys.exit(1)
 
     tg_request = HTTPXRequest(
         connect_timeout=30,
@@ -3722,10 +3769,17 @@ def main():
     )
 
     async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
-        if isinstance(context.error, (TimedOut, NetworkError)):
-            logging.warning("Telegram network error while processing update=%r", update, exc_info=context.error)
+        err = context.error
+        if isinstance(err, Forbidden):
+            logging.warning("Forbidden (bot blocked / no rights). update=%r", update)
             return
-        logging.exception("Unhandled error while processing update=%r", update, exc_info=context.error)
+        if isinstance(err, BadRequest):
+            logging.warning("BadRequest while processing update=%r", update, exc_info=err)
+            return
+        if isinstance(err, (TimedOut, NetworkError)):
+            logging.warning("Telegram network error while processing update=%r", update, exc_info=err)
+            return
+        logging.exception("Unhandled error while processing update=%r", update, exc_info=err)
 
     app.add_error_handler(error_handler)
 
