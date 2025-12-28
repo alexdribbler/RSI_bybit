@@ -17,7 +17,7 @@ from decimal import Decimal, InvalidOperation
 from dataclasses import dataclass
 from datetime import datetime
 from io import BytesIO
-from typing import Awaitable, Callable, Dict, FrozenSet, List, Optional, Tuple, Set, cast
+from typing import Awaitable, Callable, Dict, FrozenSet, List, Optional, Tuple, Set, Union, cast
 from zoneinfo import ZoneInfo
 
 import aiohttp
@@ -122,6 +122,8 @@ KLINE_LIMIT = int(os.getenv("KLINE_LIMIT", "120"))
 TICKERS_CACHE_TTL = int(os.getenv("TICKERS_CACHE_TTL", "60"))
 PERP_SYMBOLS_CACHE_TTL = int(os.getenv("PERP_SYMBOLS_CACHE_TTL", "3600"))
 INNOVATION_SYMBOLS_CACHE_TTL = int(os.getenv("INNOVATION_SYMBOLS_CACHE_TTL", str(6 * 3600)))
+TICKERS_SANITY_MIN_RATIO = float(os.getenv("TICKERS_SANITY_MIN_RATIO", "0.5"))
+TICKERS_SANITY_MIN_COUNT = int(os.getenv("TICKERS_SANITY_MIN_COUNT", "50"))
 
 LOCAL_TZ = ZoneInfo(os.getenv("LOCAL_TZ", "Asia/Ho_Chi_Minh"))
 
@@ -605,7 +607,7 @@ async def get_valid_symbols_with_fallback(app: Application) -> Optional[Set[str]
     if perp_cache and perp_cache.value:
         base_symbols = set(perp_cache.value)
         session: aiohttp.ClientSession = app.bot_data["http_session"]
-        rate_limiter: RateLimiter = app.bot_data["rate_limiter"]
+        rate_limiter: RateLimiterLike = app.bot_data["rate_limiter"]
         innovation_symbols = await get_innovation_zone_symbols(app, session, rate_limiter)
         return base_symbols.union(innovation_symbols)
 
@@ -616,7 +618,7 @@ async def get_valid_symbols_with_fallback(app: Application) -> Optional[Set[str]
         return None
 
     session: aiohttp.ClientSession = app.bot_data["http_session"]
-    rate_limiter: RateLimiter = app.bot_data["rate_limiter"]
+    rate_limiter: RateLimiterLike = app.bot_data["rate_limiter"]
     innovation_symbols = await get_innovation_zone_symbols(app, session, rate_limiter)
     return set(symbols).union(innovation_symbols)
 
@@ -839,11 +841,45 @@ class RateLimiter:
             return self._delay
 
 
+class RateLimiterGroup:
+    def __init__(self) -> None:
+        self._limiters: Dict[str, RateLimiter] = {
+            "default": RateLimiter(),
+            "kline": RateLimiter(),
+            "tickers": RateLimiter(),
+            "instruments": RateLimiter(),
+        }
+
+    def get_for_url(self, url: str) -> RateLimiter:
+        if "/v5/market/kline" in url:
+            return self._limiters["kline"]
+        if "/v5/market/tickers" in url:
+            return self._limiters["tickers"]
+        if "/v5/market/instruments-info" in url or "/v5/market/fee-group-info" in url:
+            return self._limiters["instruments"]
+        return self._limiters["default"]
+
+    async def get_current_delay(self) -> float:
+        delays = await asyncio.gather(
+            *(limiter.get_current_delay() for limiter in self._limiters.values())
+        )
+        return max(delays, default=RATE_LIMIT_DELAY)
+
+
+RateLimiterLike = Union[RateLimiter, RateLimiterGroup]
+
+
+def select_rate_limiter(rate_limiter: RateLimiterLike, url: str) -> RateLimiter:
+    if isinstance(rate_limiter, RateLimiterGroup):
+        return rate_limiter.get_for_url(url)
+    return rate_limiter
+
+
 async def api_get_json(
     session: aiohttp.ClientSession,
     url: str,
     params: Dict[str, str],
-    rate_limiter: RateLimiter,
+    rate_limiter: RateLimiterLike,
     retries: int = 5,
     raise_on_rate_limit: bool = False,
 ) -> dict:
@@ -853,7 +889,8 @@ async def api_get_json(
 
     while attempt < retries:
         try:
-            await rate_limiter.acquire()
+            limiter = select_rate_limiter(rate_limiter, url)
+            await limiter.acquire()
 
             async with session.get(
                 url,
@@ -861,7 +898,7 @@ async def api_get_json(
                 timeout=aiohttp.ClientTimeout(total=API_GET_REQUEST_TIMEOUT),
             ) as resp:
                 if resp.status == 429:
-                    await rate_limiter.report_rate_limit()
+                    await limiter.report_rate_limit()
                     raise RateLimitError("Bybit rate limit: HTTP 429 (Too many requests)")
                 data = await resp.json(content_type=None)
 
@@ -872,7 +909,7 @@ async def api_get_json(
 
                 # Common rate limit code
                 if data.get("retCode") == 10006:
-                    await rate_limiter.report_rate_limit()
+                    await limiter.report_rate_limit()
                     raise RateLimitError("Bybit rate limit: retCode=10006 (Too many visits!)")
 
                 if resp.status >= 400:
@@ -884,7 +921,7 @@ async def api_get_json(
                     )
 
                 # Report success to gradually reduce delays
-                await rate_limiter.report_success()
+                await limiter.report_success()
                 return data
 
         except RateLimitError as e:
@@ -912,7 +949,7 @@ async def api_get_json(
 # =========================
 async def get_all_usdt_linear_perp_symbols(
     session: aiohttp.ClientSession,
-    rate_limiter: RateLimiter,
+    rate_limiter: RateLimiterLike,
     innovation_symbols: Optional[Set[str]] = None,
 ) -> List[str]:
     """
@@ -967,7 +1004,7 @@ async def get_all_usdt_linear_perp_symbols(
     return symbols
 
 
-async def get_linear_tickers(session: aiohttp.ClientSession, rate_limiter: RateLimiter, symbol: Optional[str] = None) -> List[dict]:
+async def get_linear_tickers(session: aiohttp.ClientSession, rate_limiter: RateLimiterLike, symbol: Optional[str] = None) -> List[dict]:
     url = f"{BYBIT_BASE_URL}/v5/market/tickers"
     params = {"category": "linear"}
     if symbol:
@@ -976,21 +1013,47 @@ async def get_linear_tickers(session: aiohttp.ClientSession, rate_limiter: RateL
     return (payload.get("result") or {}).get("list") or []
 
 
+def expected_min_ticker_count(symbol_count: int) -> int:
+    if symbol_count <= 0:
+        return 0
+    return max(TICKERS_SANITY_MIN_COUNT, int(math.ceil(symbol_count * TICKERS_SANITY_MIN_RATIO)))
+
+
 async def pick_top_symbols_by_turnover(
     session: aiohttp.ClientSession,
-    rate_limiter: RateLimiter,
+    rate_limiter: RateLimiterLike,
     perp_symbols_set: set,
     limit: int,
     innovation_symbols: Optional[Set[str]] = None,
+    fallback_symbols: Optional[List[str]] = None,
 ) -> List[str]:
     tickers = await get_linear_tickers(session, rate_limiter)
     rows: List[Tuple[str, float]] = []
+    filtered_symbols = set(perp_symbols_set)
+    if innovation_symbols:
+        filtered_symbols -= set(innovation_symbols)
+
+    min_expected = expected_min_ticker_count(len(filtered_symbols))
+    if len(tickers) < min_expected:
+        logging.warning(
+            "Suspiciously low ticker count (tickers=%d min_expected=%d perp_symbols=%d). "
+            "Falling back to unordered symbols.",
+            len(tickers),
+            min_expected,
+            len(filtered_symbols),
+        )
+        if fallback_symbols:
+            fallback = [s for s in fallback_symbols if s in filtered_symbols]
+        else:
+            fallback = []
+        if len(fallback) < limit:
+            remaining = sorted(filtered_symbols - set(fallback))
+            fallback.extend(remaining)
+        return fallback[:limit]
 
     for it in tickers:
         sym = it.get("symbol", "")
-        if sym not in perp_symbols_set:
-            continue
-        if innovation_symbols and sym in innovation_symbols:
+        if sym not in filtered_symbols:
             continue
         try:
             turnover = float(it.get("turnover24h") or 0.0)
@@ -1163,7 +1226,7 @@ async def get_binance_futures_symbols(session: aiohttp.ClientSession) -> FrozenS
 
 async def get_kline_rows(
     session: aiohttp.ClientSession,
-    rate_limiter: RateLimiter,
+    rate_limiter: RateLimiterLike,
     symbol: str,
     interval: str,
     limit: int,
@@ -1189,7 +1252,7 @@ async def get_kline_rows(
 
 async def get_kline_closes(
     session: aiohttp.ClientSession,
-    rate_limiter: RateLimiter,
+    rate_limiter: RateLimiterLike,
     symbol: str,
     interval: str,
     limit: int,
@@ -1386,7 +1449,7 @@ class MonitorRow:
 
 async def compute_symbol_indicators(
     session: aiohttp.ClientSession,
-    rate_limiter: RateLimiter,
+    rate_limiter: RateLimiterLike,
     sem: asyncio.Semaphore,
     symbol: str,
 ) -> Optional[MonitorRow]:
@@ -1444,7 +1507,7 @@ async def compute_symbol_indicators(
 # =========================
 # EXTRA: symbol click calc (price + Stoch RSI)
 # =========================
-async def get_last_price(session: aiohttp.ClientSession, rate_limiter: RateLimiter, symbol: str) -> float:
+async def get_last_price(session: aiohttp.ClientSession, rate_limiter: RateLimiterLike, symbol: str) -> float:
     items = await get_linear_tickers(session, rate_limiter, symbol=symbol)
     if not items:
         raise BybitAPIError(f"Ticker empty for {symbol}")
@@ -1473,7 +1536,7 @@ async def get_last_price(session: aiohttp.ClientSession, rate_limiter: RateLimit
 
 async def get_stoch_rsi_values(
     session: aiohttp.ClientSession,
-    rate_limiter: RateLimiter,
+    rate_limiter: RateLimiterLike,
     symbol: str,
     sem: Optional[asyncio.Semaphore] = None,
 ) -> Dict[str, Tuple[float, float]]:
@@ -1505,7 +1568,7 @@ async def get_stoch_rsi_values(
 
 async def get_rsi_values(
     session: aiohttp.ClientSession,
-    rate_limiter: RateLimiter,
+    rate_limiter: RateLimiterLike,
     sem: asyncio.Semaphore,
     symbol: str,
 ) -> Dict[str, float]:
@@ -1523,7 +1586,7 @@ async def get_rsi_values(
 
 async def get_macd_values(
     session: aiohttp.ClientSession,
-    rate_limiter: RateLimiter,
+    rate_limiter: RateLimiterLike,
     sem: asyncio.Semaphore,
     symbol: str,
 ) -> Dict[str, Tuple[float, float, float]]:
@@ -2593,7 +2656,7 @@ async def delete_alert_state(
 async def get_innovation_zone_symbols(
     app: Application,
     session: aiohttp.ClientSession,
-    rate_limiter: RateLimiter,
+    rate_limiter: RateLimiterLike,
 ) -> Set[str]:
     """
     Fetch Innovation Zone symbols (fee group 6). Fail-open on errors.
@@ -2629,7 +2692,7 @@ async def get_innovation_zone_symbols(
 async def _refresh_innovation_zone_symbols(
     app: Application,
     session: aiohttp.ClientSession,
-    rate_limiter: RateLimiter,
+    rate_limiter: RateLimiterLike,
 ) -> Set[str]:
     url = f"{BYBIT_BASE_URL}/v5/market/fee-group-info"
     params = {"productType": "contract", "groupId": "6"}
@@ -2660,7 +2723,7 @@ async def get_cached_perp_symbols(app: Application) -> Set[str]:
             return cached.value  # type: ignore
 
         session: aiohttp.ClientSession = app.bot_data["http_session"]
-        rate_limiter: RateLimiter = app.bot_data["rate_limiter"]
+        rate_limiter: RateLimiterLike = app.bot_data["rate_limiter"]
         innovation_symbols = await get_innovation_zone_symbols(app, session, rate_limiter)
         symbols = set(
             await get_all_usdt_linear_perp_symbols(
@@ -2683,7 +2746,8 @@ async def get_cached_top_symbols(app: Application) -> List[str]:
             return cached.value  # type: ignore
 
         session: aiohttp.ClientSession = app.bot_data["http_session"]
-        rate_limiter: RateLimiter = app.bot_data["rate_limiter"]
+        rate_limiter: RateLimiterLike = app.bot_data["rate_limiter"]
+        fallback_symbols = cached.value if cached else None
         try:
             perp_symbols = await get_cached_perp_symbols(app)
             innovation_symbols = await _refresh_innovation_zone_symbols(app, session, rate_limiter)
@@ -2693,6 +2757,7 @@ async def get_cached_top_symbols(app: Application) -> List[str]:
                 perp_symbols,
                 MAX_SYMBOLS,
                 innovation_symbols=innovation_symbols,
+                fallback_symbols=fallback_symbols,
             )
         except Exception as e:
             if cached:
@@ -3003,7 +3068,7 @@ async def run_monitor_once_internal(app: Application, chat_id: int, timeout_sec:
         aiohttp.ClientSession,
         get_required_bot_data(app, "http_session", aiohttp.ClientSession),
     )
-    rate_limiter = cast(RateLimiter, get_required_bot_data(app, "rate_limiter", RateLimiter))
+    rate_limiter = cast(RateLimiterLike, get_required_bot_data(app, "rate_limiter", RateLimiterGroup))
     symbols = await get_cached_top_symbols(app)
     sem = cast(
         asyncio.Semaphore,
@@ -3156,7 +3221,7 @@ async def run_monitor_once(app: Application, chat_id: int):
                 text="⏳ Мониторинг уже выполняется, подождите…",
             )
             return
-        rate_limiter = cast(RateLimiter, get_required_bot_data(app, "rate_limiter", RateLimiter))
+        rate_limiter = cast(RateLimiterLike, get_required_bot_data(app, "rate_limiter", RateLimiterGroup))
         current_delay = await rate_limiter.get_current_delay()
         delay_factor = max(1.0, current_delay / RATE_LIMIT_DELAY)
         adaptive_timeout = int(MONITOR_TIMEOUT * delay_factor * 1.15)
@@ -3237,7 +3302,7 @@ async def alert_job_callback(context: ContextTypes.DEFAULT_TYPE):
         created_at_update = now if created_at is None else _ALERT_ENTRY_MISSING
 
         session: aiohttp.ClientSession = app.bot_data["http_session"]
-        rate_limiter: RateLimiter = app.bot_data["rate_limiter"]
+        rate_limiter: RateLimiterLike = app.bot_data["rate_limiter"]
 
         try:
             sem: asyncio.Semaphore = app.bot_data["http_sem"]
@@ -3372,7 +3437,12 @@ async def cleanup_job(context: ContextTypes.DEFAULT_TYPE) -> None:
         app.bot_data["monitor_tasks"] = {task for task in monitor_tasks if not task.done()}
 
     state_lock: asyncio.Lock = app.bot_data["state_lock"]
-    async with state_lock:
+    try:
+        await asyncio.wait_for(state_lock.acquire(), timeout=2)
+    except asyncio.TimeoutError:
+        logging.warning("cleanup_job skipped: state_lock busy")
+        return
+    try:
         state = app.bot_data.get("state") or {
             "subs": {},
             "alerts": {},
@@ -3383,6 +3453,8 @@ async def cleanup_job(context: ContextTypes.DEFAULT_TYPE) -> None:
         if changed:
             app.bot_data["state"] = state
             await persist_state(app, state)
+    finally:
+        state_lock.release()
 
 
 async def price_alert_job_callback(context: ContextTypes.DEFAULT_TYPE):
@@ -3412,7 +3484,7 @@ async def price_alert_job_callback(context: ContextTypes.DEFAULT_TYPE):
 
     try:
         session: aiohttp.ClientSession = app.bot_data["http_session"]
-        rate_limiter: RateLimiter = app.bot_data["rate_limiter"]
+        rate_limiter: RateLimiterLike = app.bot_data["rate_limiter"]
         current_price = await get_last_price(session, rate_limiter, symbol)
         target_value = float(entry.get("price", target_price))
         direction = entry.get("direction", direction)
@@ -3445,7 +3517,7 @@ async def pair_rsi_alert_job_callback(context: ContextTypes.DEFAULT_TYPE):
         return
 
     session: aiohttp.ClientSession = app.bot_data["http_session"]
-    rate_limiter: RateLimiter = app.bot_data["rate_limiter"]
+    rate_limiter: RateLimiterLike = app.bot_data["rate_limiter"]
     sem: asyncio.Semaphore = app.bot_data["http_sem"]
 
     try:
@@ -3533,26 +3605,29 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.effective_chat or not update.message:
         return
+    if not update.effective_user:
+        return
     chat_id = update.effective_chat.id
     app = context.application
+    ud = context.user_data
 
-    if context.user_data.get("price_alert_confirm"):
+    if ud.get("price_alert_confirm"):
         await update.message.reply_text(
             "Подтвердите цену кнопками ниже или вернитесь в меню.",
             reply_markup=price_alert_confirm_kb(),
         )
         return
 
-    if context.user_data.get("await_price_alert"):
+    if ud.get("await_price_alert"):
         raw_price = (update.message.text or "").strip()
         price_value = parse_price_input(raw_price)
         if not price_value:
             await update.message.reply_text("Введите корректную цену, например 0.0015 или 25000.")
             return
 
-        symbol = context.user_data.get("price_alert_symbol")
+        symbol = ud.get("price_alert_symbol")
         if not symbol:
-            context.user_data["await_price_alert"] = False
+            ud["await_price_alert"] = False
             await update.message.reply_text("Не удалось определить символ. Начните заново через меню.")
             return
 
@@ -3562,11 +3637,11 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         if not validate_symbol(symbol, valid_symbols):
             await update.message.reply_text("Некорректный символ. Попробуйте заново через меню.")
-            context.user_data["await_price_alert"] = False
+            ud["await_price_alert"] = False
             return
 
         session: aiohttp.ClientSession = app.bot_data["http_session"]
-        rate_limiter: RateLimiter = app.bot_data["rate_limiter"]
+        rate_limiter: RateLimiterLike = app.bot_data["rate_limiter"]
         try:
             current_price = await get_last_price(session, rate_limiter, symbol)
         except Exception as e:
@@ -3577,8 +3652,8 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         direction = "UP" if float(price_value) >= current_price else "DOWN"
         price_text = normalize_price_text(price_value)
         if needs_price_confirmation(current_price, price_value):
-            context.user_data["await_price_alert"] = False
-            context.user_data["price_alert_confirm"] = {
+            ud["await_price_alert"] = False
+            ud["price_alert_confirm"] = {
                 "symbol": symbol,
                 "price_value": str(price_value),
                 "price_text": price_text,
@@ -3596,11 +3671,11 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         created = await apply_price_alert(app, chat_id, symbol, price_value, direction, valid_symbols)
         if created:
-            context.user_data["await_price_alert"] = False
-            context.user_data.pop("price_alert_symbol", None)
+            ud["await_price_alert"] = False
+            ud.pop("price_alert_symbol", None)
         return
 
-    if context.user_data.get("await_pair_info"):
+    if ud.get("await_pair_info"):
         raw_symbol = (update.message.text or "").strip()
         symbol = normalize_symbol(raw_symbol)
         if not symbol:
@@ -3616,11 +3691,11 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("Некорректный символ. Попробуйте ещё раз.")
             return
 
-        context.user_data["await_pair_info"] = False
+        ud["await_pair_info"] = False
         await update.message.reply_text(f"Считаю {symbol}…")
 
         session: aiohttp.ClientSession = app.bot_data["http_session"]
-        rate_limiter: RateLimiter = app.bot_data["rate_limiter"]
+        rate_limiter: RateLimiterLike = app.bot_data["rate_limiter"]
         sem: asyncio.Semaphore = app.bot_data["http_sem"]
 
         try:
@@ -3639,7 +3714,7 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(msg, parse_mode="HTML", reply_markup=pair_info_actions_kb(symbol))
         return
 
-    if context.user_data.get("await_interval"):
+    if ud.get("await_interval"):
         raw = (update.message.text or "").strip()
         try:
             minutes = int(raw)
@@ -3655,7 +3730,7 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         await apply_interval(app, chat_id, minutes)
-        context.user_data["await_interval"] = False
+        ud["await_interval"] = False
         return
 
     sub = await get_sub(app, chat_id)
@@ -3713,34 +3788,38 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     if not query or not query.message or not update.effective_chat:
         return
+    ud = context.user_data
+    if ud is None:
+        await query.answer("Открой /start и попробуй снова", show_alert=True)
+        return
     await query.answer()
 
     chat_id = query.message.chat_id
     app = context.application
     session: aiohttp.ClientSession = app.bot_data["http_session"]
-    rate_limiter: RateLimiter = app.bot_data["rate_limiter"]
+    rate_limiter: RateLimiterLike = app.bot_data["rate_limiter"]
 
     data = query.data or ""
     sub = await get_sub(app, chat_id)
     has_sub = bool(sub and sub.get("enabled"))
 
     if data == "MENU":
-        context.user_data["await_interval"] = False
-        context.user_data["await_pair_info"] = False
-        context.user_data["await_price_alert"] = False
-        context.user_data.pop("price_alert_symbol", None)
-        context.user_data.pop("price_alert_confirm", None)
-        context.user_data.pop("pair_track_symbol", None)
-        context.user_data.pop("pair_track_tfs", None)
+        ud["await_interval"] = False
+        ud["await_pair_info"] = False
+        ud["await_price_alert"] = False
+        ud.pop("price_alert_symbol", None)
+        ud.pop("price_alert_confirm", None)
+        ud.pop("pair_track_symbol", None)
+        ud.pop("pair_track_tfs", None)
         await query.edit_message_text("Меню RSI-бота:", reply_markup=main_menu_kb(has_sub))
         return
 
     if data == "SUB_CREATE":
-        context.user_data["await_interval"] = True
-        context.user_data["await_pair_info"] = False
-        context.user_data["await_price_alert"] = False
-        context.user_data.pop("price_alert_symbol", None)
-        context.user_data.pop("price_alert_confirm", None)
+        ud["await_interval"] = True
+        ud["await_pair_info"] = False
+        ud["await_price_alert"] = False
+        ud.pop("price_alert_symbol", None)
+        ud.pop("price_alert_confirm", None)
         await query.edit_message_text(
             "Введите интервал в минутах (например 15) сообщением в чат — или выберите кнопкой:",
             reply_markup=interval_picker_kb(),
@@ -3748,7 +3827,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if data.startswith("SETINT:"):
-        context.user_data["await_interval"] = False
+        ud["await_interval"] = False
         try:
             minutes = int(data.split(":", 1)[1])
         except Exception:
@@ -3766,7 +3845,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if data == "SUB_VIEW":
-        context.user_data["await_interval"] = False
+        ud["await_interval"] = False
         sub = await get_sub(app, chat_id)
         if not sub or not sub.get("enabled"):
             await query.edit_message_text("Подписка не создана.\nНажмите «Создать подписку».", reply_markup=main_menu_kb(False))
@@ -3779,18 +3858,18 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if data == "SUB_DELETE":
-        context.user_data["await_interval"] = False
+        ud["await_interval"] = False
         unschedule_subscription(app, chat_id)
         await delete_sub(app, chat_id)
         await query.edit_message_text("🗑 Подписка удалена.", reply_markup=main_menu_kb(False))
         return
 
     if data == "RUN_NOW":
-        context.user_data["await_interval"] = False
-        context.user_data["await_pair_info"] = False
-        context.user_data["await_price_alert"] = False
-        context.user_data.pop("price_alert_symbol", None)
-        context.user_data.pop("price_alert_confirm", None)
+        ud["await_interval"] = False
+        ud["await_pair_info"] = False
+        ud["await_price_alert"] = False
+        ud.pop("price_alert_symbol", None)
+        ud.pop("price_alert_confirm", None)
         remaining = await check_action_cooldown(app, chat_id, "RUN_NOW", HEAVY_ACTION_COOLDOWN_SEC)
         if remaining > 0:
             await tg_call_with_retry(
@@ -3808,13 +3887,13 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if data == "PAIR_INFO":
-        context.user_data["await_pair_info"] = True
-        context.user_data["await_interval"] = False
-        context.user_data["await_price_alert"] = False
-        context.user_data.pop("price_alert_symbol", None)
-        context.user_data.pop("price_alert_confirm", None)
-        context.user_data.pop("pair_track_symbol", None)
-        context.user_data.pop("pair_track_tfs", None)
+        ud["await_pair_info"] = True
+        ud["await_interval"] = False
+        ud["await_price_alert"] = False
+        ud.pop("price_alert_symbol", None)
+        ud.pop("price_alert_confirm", None)
+        ud.pop("pair_track_symbol", None)
+        ud.pop("pair_track_tfs", None)
         await query.edit_message_text("Введите торговую пару (пример BTCUSDT или BTC/USDT):")
         return
 
@@ -3837,10 +3916,10 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await app.bot.send_message(chat_id=chat_id, text="Не удалось получить текущую цену. Попробуйте позже.")
             return
 
-        context.user_data["await_price_alert"] = True
-        context.user_data["await_pair_info"] = False
-        context.user_data["price_alert_symbol"] = symbol
-        context.user_data.pop("price_alert_confirm", None)
+        ud["await_price_alert"] = True
+        ud["await_pair_info"] = False
+        ud["price_alert_symbol"] = symbol
+        ud.pop("price_alert_confirm", None)
         await query.edit_message_text(
             f"Введите цену для alert по {symbol}.\nТекущая цена: {current_price}",
         )
@@ -3851,7 +3930,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if len(parts) != 2:
             return
         action = parts[1]
-        confirm_data = context.user_data.get("price_alert_confirm")
+        confirm_data = ud.get("price_alert_confirm")
         if not confirm_data:
             await app.bot.send_message(chat_id=chat_id, text="Нет активного подтверждения.")
             return
@@ -3860,11 +3939,11 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             current_price = confirm_data.get("current_price")
             if not symbol:
                 await app.bot.send_message(chat_id=chat_id, text="Данные подтверждения устарели. Начните заново.")
-                context.user_data.pop("price_alert_confirm", None)
+                ud.pop("price_alert_confirm", None)
                 return
-            context.user_data["await_price_alert"] = True
-            context.user_data["price_alert_symbol"] = symbol
-            context.user_data.pop("price_alert_confirm", None)
+            ud["await_price_alert"] = True
+            ud["price_alert_symbol"] = symbol
+            ud.pop("price_alert_confirm", None)
             await query.edit_message_text(
                 f"Введите новую цену для {symbol}.\nТекущая цена: {current_price}",
             )
@@ -3875,18 +3954,18 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             direction = confirm_data.get("direction")
             if not symbol or not price_raw or direction not in {"UP", "DOWN"}:
                 await app.bot.send_message(chat_id=chat_id, text="Данные подтверждения устарели. Начните заново.")
-                context.user_data.pop("price_alert_confirm", None)
+                ud.pop("price_alert_confirm", None)
                 return
             price_value = parse_price_input(str(price_raw))
             if not price_value:
                 await app.bot.send_message(chat_id=chat_id, text="Некорректная цена. Начните заново.")
-                context.user_data.pop("price_alert_confirm", None)
+                ud.pop("price_alert_confirm", None)
                 return
             created = await apply_price_alert(app, chat_id, symbol, price_value, direction)
             if created:
-                context.user_data["await_price_alert"] = False
-                context.user_data.pop("price_alert_symbol", None)
-                context.user_data.pop("price_alert_confirm", None)
+                ud["await_price_alert"] = False
+                ud.pop("price_alert_symbol", None)
+                ud.pop("price_alert_confirm", None)
             return
 
     if data.startswith("PAIRTRACK|"):
@@ -3894,9 +3973,9 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             _, symbol = data.split("|", 1)
         except ValueError:
             return
-        context.user_data["await_price_alert"] = False
-        context.user_data.pop("price_alert_symbol", None)
-        context.user_data.pop("price_alert_confirm", None)
+        ud["await_price_alert"] = False
+        ud.pop("price_alert_symbol", None)
+        ud.pop("price_alert_confirm", None)
         valid_symbols = await get_valid_symbols_with_fallback(app)
         if not valid_symbols:
             await app.bot.send_message(chat_id=chat_id, text="Whitelist временно недоступен.")
@@ -3904,8 +3983,8 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not validate_symbol(symbol, valid_symbols):
             await app.bot.send_message(chat_id=chat_id, text="Некорректный символ.")
             return
-        context.user_data["pair_track_symbol"] = symbol
-        context.user_data["pair_track_tfs"] = set()
+        ud["pair_track_symbol"] = symbol
+        ud["pair_track_tfs"] = set()
         await query.edit_message_text(
             "Выберите таймфреймы для отслеживания (можно несколько):",
             reply_markup=pair_track_tf_kb(symbol, set()),
@@ -3917,15 +3996,15 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if len(parts) != 3:
             return
         _, symbol, label = parts
-        if context.user_data.get("pair_track_symbol") != symbol:
-            context.user_data["pair_track_symbol"] = symbol
-            context.user_data["pair_track_tfs"] = set()
-        selected: Set[str] = context.user_data.get("pair_track_tfs", set())
+        if ud.get("pair_track_symbol") != symbol:
+            ud["pair_track_symbol"] = symbol
+            ud["pair_track_tfs"] = set()
+        selected: Set[str] = ud.get("pair_track_tfs", set())
         if label in selected:
             selected.remove(label)
         else:
             selected.add(label)
-        context.user_data["pair_track_tfs"] = selected
+        ud["pair_track_tfs"] = selected
         await query.edit_message_text(
             "Выберите таймфреймы для отслеживания (можно несколько):",
             reply_markup=pair_track_tf_kb(symbol, selected),
@@ -3934,7 +4013,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if data.startswith("PAIRTRACK_TF_CONFIRM|"):
         _, symbol = data.split("|", 1)
-        selected: Set[str] = context.user_data.get("pair_track_tfs", set())
+        selected: Set[str] = ud.get("pair_track_tfs", set())
         if not selected:
             await app.bot.send_message(chat_id=chat_id, text="Выберите хотя бы один таймфрейм.")
             return
@@ -3946,7 +4025,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if data.startswith("PAIRTRACK_TF_BACK|"):
         _, symbol = data.split("|", 1)
-        selected: Set[str] = context.user_data.get("pair_track_tfs", set())
+        selected: Set[str] = ud.get("pair_track_tfs", set())
         await query.edit_message_text(
             "Выберите таймфреймы для отслеживания (можно несколько):",
             reply_markup=pair_track_tf_kb(symbol, selected),
@@ -3958,7 +4037,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if len(parts) != 3:
             return
         _, symbol, mode = parts
-        selected: Set[str] = context.user_data.get("pair_track_tfs", set())
+        selected: Set[str] = ud.get("pair_track_tfs", set())
         if not selected:
             await app.bot.send_message(chat_id=chat_id, text="Выберите таймфреймы для отслеживания.")
             return
@@ -3975,8 +4054,8 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await app.bot.send_message(chat_id=chat_id, text=err or "Не удалось создать отслеживание.")
             return
         schedule_pair_rsi_alerts(app, chat_id)
-        context.user_data.pop("pair_track_symbol", None)
-        context.user_data.pop("pair_track_tfs", None)
+        ud.pop("pair_track_symbol", None)
+        ud.pop("pair_track_tfs", None)
         mode_label = (
             f"<= {PAIR_RSI_LOW_THRESHOLD:.0f}" if mode == "LOW" else f">= {PAIR_RSI_HIGH_THRESHOLD:.0f}"
         )
@@ -4159,7 +4238,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def post_init(app: Application):
     try:
         app.bot_data["http_session"] = aiohttp.ClientSession()
-        app.bot_data["rate_limiter"] = RateLimiter()
+        app.bot_data["rate_limiter"] = RateLimiterGroup()
         app.bot_data["state_lock"] = asyncio.Lock()
         app.bot_data["state_write_lock"] = asyncio.Lock()
         app.bot_data["state_save_event"] = asyncio.Event()
@@ -4228,7 +4307,7 @@ async def post_init(app: Application):
             with contextlib.suppress(Exception):
                 await session.close()
         app.bot_data["http_session"] = aiohttp.ClientSession()
-        app.bot_data["rate_limiter"] = RateLimiter()
+        app.bot_data["rate_limiter"] = RateLimiterGroup()
         app.bot_data["state_lock"] = asyncio.Lock()
         app.bot_data["state_write_lock"] = asyncio.Lock()
         app.bot_data["state_save_event"] = asyncio.Event()
