@@ -53,7 +53,6 @@ TIMEFRAME_REGISTRY: Dict[str, str] = {
     "15m": "15",
     "30m": "30",
     "1h": "60",
-    "2h": "120",
     "4h": "240",
 }
 TIMEFRAME_BY_INTERVAL = {interval: label for label, interval in TIMEFRAME_REGISTRY.items()}
@@ -61,13 +60,15 @@ TIMEFRAME_BY_INTERVAL = {interval: label for label, interval in TIMEFRAME_REGIST
 # RSI timeframes for SUM (now includes 5m)
 TIMEFRAMES: List[Tuple[str, str]] = [(label, interval) for label, interval in TIMEFRAME_REGISTRY.items()]
 
-# Alert options (fixed to 5m/15m/30m)
+# Alert options (fixed to 5m/15m/30m/1h/4h)
 ALERT_TFS: List[Tuple[str, str]] = [
     (label, interval)
     for label, interval in TIMEFRAME_REGISTRY.items()
-    if label in {"5m", "15m", "30m"}
+    if label in {"5m", "15m", "30m", "1h", "4h"}
 ]
 ALERT_INTERVALS = {iv for _, iv in ALERT_TFS}
+ALERT_SLOW_TFS = {"60", "240"}
+ALERT_SLOW_CHECK_SEC = int(os.getenv("ALERT_SLOW_CHECK_SEC", str(15 * 60)))
 
 STOCH_RSI_TFS: List[Tuple[str, str]] = list(TIMEFRAMES)
 
@@ -152,6 +153,8 @@ def validate_config() -> None:
         errors.append("LEVERAGE must be > 0")
     if ALERT_CHECK_SEC <= 0:
         errors.append("ALERT_CHECK_SEC must be > 0")
+    if ALERT_SLOW_CHECK_SEC <= 0:
+        errors.append("ALERT_SLOW_CHECK_SEC must be > 0")
     if PRICE_ALERT_CHECK_SEC <= 0:
         errors.append("PRICE_ALERT_CHECK_SEC must be > 0")
     if ALERT_ERROR_THROTTLE_MIN <= 0:
@@ -434,6 +437,12 @@ def get_sub_job_name(chat_id: int) -> str:
 
 def get_alert_job_name(chat_id: int, symbol: str, tf: str) -> str:
     return f"rsi_alert:{chat_id}:{symbol}:{tf}"
+
+
+def alert_check_interval_sec(tf: str) -> int:
+    if tf in ALERT_SLOW_TFS:
+        return ALERT_SLOW_CHECK_SEC
+    return ALERT_CHECK_SEC
 
 
 def get_pair_rsi_alert_job_name(chat_id: int) -> str:
@@ -909,7 +918,7 @@ async def compute_symbol_rsi_sum(
 
 
 # =========================
-# EXTRA: symbol click calc (1h high/low + RR)
+# EXTRA: symbol click calc (price + Stoch RSI)
 # =========================
 async def get_last_price(session: aiohttp.ClientSession, rate_limiter: RateLimiter, symbol: str) -> float:
     items = await get_linear_tickers(session, rate_limiter, symbol=symbol)
@@ -936,28 +945,6 @@ async def get_last_price(session: aiohttp.ClientSession, rate_limiter: RateLimit
     if price is None:
         raise BybitAPIError(f"No valid price for {symbol}: {it}")
     return price
-
-
-async def get_last_hour_high_low(session: aiohttp.ClientSession, rate_limiter: RateLimiter, symbol: str) -> Tuple[float, float]:
-    # 1m candles, last 60 minutes
-    rows = await get_kline_rows(session, rate_limiter, symbol, interval="1", limit=60)
-    if not rows:
-        raise BybitAPIError(f"No 1m kline for {symbol}")
-    hi = None
-    lo = None
-    for c in rows:
-        if not isinstance(c, list) or len(c) < 5:
-            continue
-        try:
-            h = float(c[2])
-            l = float(c[3])
-        except Exception:
-            continue
-        hi = h if hi is None else max(hi, h)
-        lo = l if lo is None else min(lo, l)
-    if hi is None or lo is None:
-        raise BybitAPIError(f"Bad 1m kline rows for {symbol}")
-    return hi, lo
 
 
 async def get_stoch_rsi_values(
@@ -1032,22 +1019,6 @@ def format_stoch_rsi_line(values: Dict[str, float]) -> str:
         else:
             parts.append(f"{label} <code>{value:.2f}</code>")
     return "Stoch RSI: " + " | ".join(parts)
-
-
-def levered_pct(delta: float, price: float, lev: float) -> float:
-    """Calculate leveraged percentage change."""
-    if not math.isfinite(price) or price <= 0:
-        return 0.0
-    if abs(price) < 1e-12:
-        return 0.0
-    return (delta / price) * 100.0 * lev
-
-
-def safe_rr(reward: float, risk: float) -> Optional[float]:
-    """Calculate risk/reward ratio safely."""
-    if risk <= 0:
-        return None
-    return reward / risk
 
 
 # =========================
@@ -1173,7 +1144,6 @@ def interval_picker_kb() -> InlineKeyboardMarkup:
         ],
         [
             InlineKeyboardButton("60 мин", callback_data="SETINT:60"),
-            InlineKeyboardButton("120 мин", callback_data="SETINT:120"),
             InlineKeyboardButton("240 мин", callback_data="SETINT:240"),
         ],
         [InlineKeyboardButton("⬅️ Назад", callback_data="MENU")],
@@ -1182,13 +1152,18 @@ def interval_picker_kb() -> InlineKeyboardMarkup:
 
 
 def alerts_kb(symbol: str, side: str) -> InlineKeyboardMarkup:
-    # 3 кнопки, как просили
     return InlineKeyboardMarkup(
-        [[
-            InlineKeyboardButton("Alert 5m", callback_data=f"ALERT|5|{side}|{symbol}"),
-            InlineKeyboardButton("Alert 15m", callback_data=f"ALERT|15|{side}|{symbol}"),
-            InlineKeyboardButton("Alert 30m", callback_data=f"ALERT|30|{side}|{symbol}"),
-        ]]
+        [
+            [
+                InlineKeyboardButton("Alert 5m", callback_data=f"ALERT|5|{side}|{symbol}"),
+                InlineKeyboardButton("Alert 15m", callback_data=f"ALERT|15|{side}|{symbol}"),
+                InlineKeyboardButton("Alert 30m", callback_data=f"ALERT|30|{side}|{symbol}"),
+            ],
+            [
+                InlineKeyboardButton("Alert 1h", callback_data=f"ALERT|60|{side}|{symbol}"),
+                InlineKeyboardButton("Alert 4h", callback_data=f"ALERT|240|{side}|{symbol}"),
+            ],
+        ]
     )
 
 
@@ -1845,9 +1820,10 @@ async def schedule_alert(
     for j in jobs:
         j.schedule_removal()
 
+    check_interval_sec = alert_check_interval_sec(tf)
     app.job_queue.run_repeating(
         alert_job_callback,
-        interval=ALERT_CHECK_SEC,
+        interval=check_interval_sec,
         first=2,
         chat_id=chat_id,
         name=name,
@@ -2995,11 +2971,10 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception:
             return
 
-        await app.bot.send_message(chat_id=chat_id, text=f"Считаю {symbol} (last 1h)…")
+        await app.bot.send_message(chat_id=chat_id, text=f"Считаю {symbol}…")
 
         try:
             price = await get_last_price(session, rate_limiter, symbol)
-            hi, lo = await get_last_hour_high_low(session, rate_limiter, symbol)
             try:
                 sem: asyncio.Semaphore = app.bot_data["http_sem"]
                 stoch_values = await get_stoch_rsi_values(session, rate_limiter, symbol, sem)
@@ -3009,53 +2984,18 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             stoch_line = format_stoch_rsi_line(stoch_values)
 
             if side == "L":
-                # LONG: risk is current to low, reward is current to high
-                dd = levered_pct(lo - price, price, LEVERAGE)     # negative (to low)
-                up = levered_pct(hi - price, price, LEVERAGE)     # positive (to high)
-                risk = (price - lo)  # distance to stop loss
-                reward = (hi - price)  # distance to take profit
-                rr = safe_rr(reward, risk)
-
                 msg = (
                     f"<b>{symbol} — LONG</b>\n"
-                    f"Current: <code>{price:.6f}</code>\n"
-                    f"1h Low:  <code>{lo:.6f}</code>\n"
-                    f"1h High: <code>{hi:.6f}</code>\n\n"
-                    f"{stoch_line}\n\n"
-                    f"To 1h low ({LEVERAGE:.0f}x): <b>{dd:.2f}%</b>\n"
-                    f"To 1h high ({LEVERAGE:.0f}x): <b>{up:.2f}%</b>\n"
+                    f"Current: <code>{price:.6f}</code>\n\n"
+                    f"{stoch_line}\n"
                 )
-                if rr is None:
-                    msg += "Risk/Reward: <b>∞</b>\n"
-                else:
-                    msg += f"Risk/Reward: <b>{rr:.2f}</b>\n"
 
             else:
-                # SHORT: entry at current price
-                # If price goes UP to 1h high → loss (risk)
-                # If price goes DOWN to 1h low → profit (reward)
-                risk = (hi - price)  # distance to stop loss (upward movement)
-                reward = (price - lo)  # distance to take profit (downward movement)
-                
-                # Calculate percentages for display
-                loss_pct = abs(levered_pct(hi - price, price, LEVERAGE))  # show as positive number
-                profit_pct = abs(levered_pct(price - lo, price, LEVERAGE))  # show as positive number
-                
-                rr = safe_rr(reward, risk)
-
                 msg = (
                     f"<b>{symbol} — SHORT</b>\n"
-                    f"Current: <code>{price:.6f}</code>\n"
-                    f"1h High: <code>{hi:.6f}</code>\n"
-                    f"1h Low:  <code>{lo:.6f}</code>\n\n"
-                    f"{stoch_line}\n\n"
-                    f"<b>If price rises to 1h high:</b> <b>-{loss_pct:.2f}%</b> (LOSS at {LEVERAGE:.0f}x)\n"
-                    f"<b>If price falls to 1h low:</b> <b>+{profit_pct:.2f}%</b> (PROFIT at {LEVERAGE:.0f}x)\n"
+                    f"Current: <code>{price:.6f}</code>\n\n"
+                    f"{stoch_line}\n"
                 )
-                if rr is None:
-                    msg += "Risk/Reward: <b>∞</b>\n"
-                else:
-                    msg += f"Risk/Reward: <b>{rr:.2f}</b>\n"
 
             await app.bot.send_message(
                 chat_id=chat_id,
@@ -3133,11 +3073,12 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             cooldowns[chat_id] = time.time()
         await schedule_alert(app, chat_id, symbol, tf, tf_label, side, valid_symbols)
 
+        check_interval_sec = alert_check_interval_sec(tf)
         await app.bot.send_message(
             chat_id=chat_id,
             text=(
                 f"✅ Alert включён: {symbol} {direction_label} RSI{RSI_PERIOD}({tf_label}) {trigger_label} "
-                f"(проверка каждые {ALERT_CHECK_SEC//60} мин)"
+                f"(проверка каждые {check_interval_sec//60} мин)"
             ),
         )
         return
