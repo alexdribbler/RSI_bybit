@@ -254,6 +254,7 @@ def load_state() -> dict:
 
 
 def save_state_json(state_json: str) -> bool:
+    tmp = None
     try:
         tmp = STATE_FILE + ".tmp"
         with open(tmp, "w", encoding="utf-8") as f:
@@ -382,6 +383,8 @@ async def state_save_worker(app: Application) -> None:
             if seq_after == seq_before:
                 save_done.set()
     except asyncio.CancelledError:
+        save_done: asyncio.Event = app.bot_data["state_save_done"]
+        save_done.set()
         raise
 
 
@@ -864,6 +867,7 @@ async def binance_get_klines(
         raise BinanceAPIError(f"Unsupported Binance interval mapping: {bybit_interval}")
     url = f"{BINANCE_BASE_URL}/api/v3/klines"
     params = {"symbol": symbol, "interval": binance_interval, "limit": str(limit)}
+    data = None
     backoff = 1.0
     for attempt in range(1, max_retries + 1):
         try:
@@ -873,7 +877,15 @@ async def binance_get_klines(
                 timeout=aiohttp.ClientTimeout(total=timeout_sec),
             ) as resp:
                 if resp.status in (418, 429):
-                    raise RateLimitError(f"Binance rate limit HTTP {resp.status}")
+                    retry_after = float(resp.headers.get("Retry-After") or 0)
+                    sleep_for = max(backoff, retry_after, 1.0)
+                    if attempt >= max_retries:
+                        raise RateLimitError(
+                            f"Binance rate limit (HTTP {resp.status}), retry_after={retry_after}"
+                        )
+                    await asyncio.sleep(sleep_for)
+                    backoff = min(backoff * 2, 60.0)
+                    continue
                 if resp.status != 200:
                     text = await resp.text()
                     raise BinanceAPIError(
@@ -885,7 +897,7 @@ async def binance_get_klines(
             if attempt >= max_retries:
                 raise
             await asyncio.sleep(backoff)
-            backoff = min(backoff * 2, 8.0)
+            backoff = min(backoff * 2, 30.0)
     if not isinstance(data, list):
         raise BinanceAPIError(f"Unexpected Binance payload type: {type(data).__name__}")
     if not data:
@@ -2643,11 +2655,11 @@ async def run_monitor_once_internal(app: Application, chat_id: int, timeout_sec:
 async def run_monitor_once(app: Application, chat_id: int):
     """Run monitor with timeout protection."""
     locks = app.bot_data.setdefault("monitor_locks", {})
-    lock = locks.get(chat_id)
-    if lock is None:
-        lock = locks[chat_id] = asyncio.Lock()
+    lock = locks.setdefault(chat_id, asyncio.Lock())
 
-    if lock.locked():
+    try:
+        await asyncio.wait_for(lock.acquire(), timeout=0)
+    except asyncio.TimeoutError:
         return
 
     monitor_tasks: Set[asyncio.Task] = app.bot_data.setdefault("monitor_tasks", set())
@@ -2659,9 +2671,9 @@ async def run_monitor_once(app: Application, chat_id: int):
         current_delay = await rate_limiter.get_current_delay()
         delay_factor = max(1.0, current_delay / RATE_LIMIT_DELAY)
         adaptive_timeout = int(MONITOR_TIMEOUT * delay_factor)
-        async with lock:
-            await run_monitor_once_internal(app, chat_id, timeout_sec=adaptive_timeout)
+        await run_monitor_once_internal(app, chat_id, timeout_sec=adaptive_timeout)
     finally:
+        lock.release()
         if current_task:
             monitor_tasks.discard(current_task)
 
