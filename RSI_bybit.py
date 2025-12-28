@@ -41,6 +41,7 @@ load_dotenv(os.path.join(BASE_DIR, ".env"))
 # CONFIG
 # =========================
 BYBIT_BASE_URL = os.getenv("BYBIT_BASE_URL", "https://api.bybit.com").rstrip("/")
+BINANCE_BASE_URL = "https://api.binance.com"
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 
 RSI_PERIOD = 6
@@ -96,6 +97,7 @@ KLINE_LIMIT = int(os.getenv("KLINE_LIMIT", "120"))
 
 TICKERS_CACHE_TTL = int(os.getenv("TICKERS_CACHE_TTL", "60"))
 PERP_SYMBOLS_CACHE_TTL = int(os.getenv("PERP_SYMBOLS_CACHE_TTL", "3600"))
+INNOVATION_SYMBOLS_CACHE_TTL = int(os.getenv("INNOVATION_SYMBOLS_CACHE_TTL", str(6 * 3600)))
 
 LOCAL_TZ = ZoneInfo(os.getenv("LOCAL_TZ", "Asia/Ho_Chi_Minh"))
 
@@ -199,6 +201,8 @@ def validate_config() -> None:
         errors.append("CLEANUP_INTERVAL_SEC must be > 0")
     if MONITOR_TIMEOUT <= 0:
         errors.append("MONITOR_TIMEOUT must be > 0")
+    if INNOVATION_SYMBOLS_CACHE_TTL <= 0:
+        errors.append("INNOVATION_SYMBOLS_CACHE_TTL must be > 0")
 
     if errors:
         msg = "Config validation failed:\n- " + "\n- ".join(errors)
@@ -465,7 +469,11 @@ async def get_valid_symbols_with_fallback(app: Application) -> Optional[Set[str]
     """Return valid symbols set, refreshing cache if missing."""
     perp_cache = app.bot_data.get("perp_symbols_cache")
     if perp_cache and perp_cache.value:
-        return set(perp_cache.value)
+        base_symbols = set(perp_cache.value)
+        session: aiohttp.ClientSession = app.bot_data["http_session"]
+        rate_limiter: RateLimiter = app.bot_data["rate_limiter"]
+        innovation_symbols = await get_innovation_zone_symbols(app, session, rate_limiter)
+        return base_symbols.union(innovation_symbols)
 
     try:
         symbols = await get_cached_perp_symbols(app)
@@ -473,7 +481,10 @@ async def get_valid_symbols_with_fallback(app: Application) -> Optional[Set[str]
         logging.warning("Failed to refresh perp symbols cache: %s", e)
         return None
 
-    return set(symbols)
+    session: aiohttp.ClientSession = app.bot_data["http_session"]
+    rate_limiter: RateLimiter = app.bot_data["rate_limiter"]
+    innovation_symbols = await get_innovation_zone_symbols(app, session, rate_limiter)
+    return set(symbols).union(innovation_symbols)
 
 
 def validate_symbol(symbol: str, valid_symbols: Optional[Set[str]] = None) -> bool:
@@ -567,6 +578,10 @@ class RateLimitError(BybitAPIError):
     pass
 
 
+class BinanceAPIError(Exception):
+    pass
+
+
 class RateLimiter:
     """Global rate limiter with dynamic backoff and queue timeout."""
     
@@ -628,6 +643,7 @@ async def api_get_json(
     params: Dict[str, str],
     rate_limiter: RateLimiter,
     retries: int = 5,
+    raise_on_rate_limit: bool = False,
 ) -> dict:
     backoff = 0.8
     last_err: Optional[Exception] = None
@@ -671,7 +687,13 @@ async def api_get_json(
 
         except RateLimitError as e:
             last_err = e
-            continue
+            if raise_on_rate_limit:
+                raise
+            attempt += 1
+            if attempt >= retries:
+                break
+            await asyncio.sleep(backoff)
+            backoff *= 1.7
         except (asyncio.TimeoutError, aiohttp.ClientError, BybitAPIError) as e:
             last_err = e
             attempt += 1
@@ -686,7 +708,11 @@ async def api_get_json(
 # =========================
 # BYBIT DATA: Perpetual symbols only
 # =========================
-async def get_all_usdt_linear_perp_symbols(session: aiohttp.ClientSession, rate_limiter: RateLimiter) -> List[str]:
+async def get_all_usdt_linear_perp_symbols(
+    session: aiohttp.ClientSession,
+    rate_limiter: RateLimiter,
+    innovation_symbols: Optional[Set[str]] = None,
+) -> List[str]:
     """
     Only LinearPerpetual (USDT-settled), status Trading, quoteCoin USDT.
     """
@@ -725,7 +751,18 @@ async def get_all_usdt_linear_perp_symbols(session: aiohttp.ClientSession, rate_
         if not cursor:
             break
 
-    return sorted(set(out))
+    symbols = sorted(set(out))
+    if innovation_symbols:
+        total = len(symbols)
+        symbols = [s for s in symbols if s not in innovation_symbols]
+        excluded = total - len(symbols)
+        logging.info(
+            "Filtered Innovation Zone symbols: total=%d excluded=%d remaining=%d",
+            total,
+            excluded,
+            len(symbols),
+        )
+    return symbols
 
 
 async def get_linear_tickers(session: aiohttp.ClientSession, rate_limiter: RateLimiter, symbol: Optional[str] = None) -> List[dict]:
@@ -742,6 +779,7 @@ async def pick_top_symbols_by_turnover(
     rate_limiter: RateLimiter,
     perp_symbols_set: set,
     limit: int,
+    innovation_symbols: Optional[Set[str]] = None,
 ) -> List[str]:
     tickers = await get_linear_tickers(session, rate_limiter)
     rows: List[Tuple[str, float]] = []
@@ -749,6 +787,8 @@ async def pick_top_symbols_by_turnover(
     for it in tickers:
         sym = it.get("symbol", "")
         if sym not in perp_symbols_set:
+            continue
+        if innovation_symbols and sym in innovation_symbols:
             continue
         try:
             turnover = float(it.get("turnover24h") or 0.0)
@@ -763,6 +803,73 @@ async def pick_top_symbols_by_turnover(
 # =========================
 # BYBIT DATA: Kline + RSI
 # =========================
+BYBIT_TO_BINANCE_INTERVAL = {
+    "1": "1m",
+    "5": "5m",
+    "15": "15m",
+    "30": "30m",
+    "60": "1h",
+    "120": "2h",
+    "240": "4h",
+}
+
+
+async def binance_get_klines(
+    session: aiohttp.ClientSession,
+    symbol: str,
+    bybit_interval: str,
+    limit: int,
+) -> List[list]:
+    binance_interval = BYBIT_TO_BINANCE_INTERVAL.get(bybit_interval)
+    if not binance_interval:
+        raise BinanceAPIError(f"Unsupported Binance interval mapping: {bybit_interval}")
+    url = f"{BINANCE_BASE_URL}/api/v3/klines"
+    params = {"symbol": symbol, "interval": binance_interval, "limit": str(limit)}
+    async with session.get(
+        url,
+        params=params,
+        timeout=aiohttp.ClientTimeout(total=API_GET_REQUEST_TIMEOUT),
+    ) as resp:
+        if resp.status >= 400:
+            raise BinanceAPIError(f"HTTP {resp.status} while fetching Binance klines")
+        data = await resp.json(content_type=None)
+    if not isinstance(data, list):
+        raise BinanceAPIError(f"Unexpected Binance payload type: {type(data).__name__}")
+    if not data:
+        return []
+    for item in data:
+        if not isinstance(item, (list, tuple)) or len(item) < 6:
+            raise BinanceAPIError("Malformed Binance kline payload")
+    return data
+
+
+async def binance_get_closes(
+    session: aiohttp.ClientSession,
+    symbol: str,
+    bybit_interval: str,
+    limit: int,
+) -> List[float]:
+    rows = await binance_get_klines(session, symbol, bybit_interval, limit)
+    if not rows:
+        raise BinanceAPIError(
+            f"No Binance kline rows for {symbol} interval={bybit_interval} limit={limit}"
+        )
+    closes: List[float] = []
+    for c in rows:
+        try:
+            value = float(c[4])
+            if not math.isfinite(value):
+                continue
+            closes.append(value)
+        except Exception:
+            continue
+    if not closes:
+        raise BinanceAPIError(
+            f"No valid Binance closes for {symbol} interval={bybit_interval} limit={limit}"
+        )
+    return closes
+
+
 async def get_kline_rows(
     session: aiohttp.ClientSession,
     rate_limiter: RateLimiter,
@@ -777,16 +884,40 @@ async def get_kline_rows(
         "interval": interval,
         "limit": str(limit),
     }
-    payload = await api_get_json(session, url, params, rate_limiter)
+    payload = await api_get_json(
+        session,
+        url,
+        params,
+        rate_limiter,
+        raise_on_rate_limit=True,
+    )
     rows = ((payload.get("result") or {}).get("list")) or []
     # API returns newest first
     return rows
 
 
 async def get_kline_closes(session: aiohttp.ClientSession, rate_limiter: RateLimiter, symbol: str, interval: str, limit: int) -> List[float]:
-    rows = await get_kline_rows(session, rate_limiter, symbol, interval, limit)
-    if not rows:
-        raise BybitAPIError(f"No kline rows for {symbol} interval={interval} limit={limit}")
+    try:
+        rows = await get_kline_rows(session, rate_limiter, symbol, interval, limit)
+        if not rows:
+            raise BybitAPIError(f"No kline rows for {symbol} interval={interval} limit={limit}")
+    except RateLimitError as e:
+        tf_label = TIMEFRAME_BY_INTERVAL.get(interval, interval)
+        logging.warning(
+            "Bybit rate limit for RSI klines (%s, %s). Falling back to Binance.",
+            symbol,
+            tf_label,
+        )
+        try:
+            return await binance_get_closes(session, symbol, interval, limit)
+        except Exception as binance_err:
+            logging.warning(
+                "Binance fallback failed for %s (%s): %s",
+                symbol,
+                tf_label,
+                binance_err,
+            )
+            raise e
     closes: List[float] = []
     for c in rows:
         # [startTime, open, high, low, close, volume, turnover]
@@ -988,6 +1119,24 @@ async def get_rsi_values(
     return {label: value for label, value in results}
 
 
+async def get_macd_values(
+    session: aiohttp.ClientSession,
+    rate_limiter: RateLimiter,
+    sem: asyncio.Semaphore,
+    symbol: str,
+) -> Dict[str, Tuple[float, float, float]]:
+    async def one_tf(tf_label: str, interval: str) -> Tuple[str, Tuple[float, float, float]]:
+        async with sem:
+            closes = await get_kline_closes(session, rate_limiter, symbol, interval, KLINE_LIMIT)
+        value = macd_from_closes(closes)
+        if value is None:
+            raise BybitAPIError(f"Not enough data for MACD {symbol} {tf_label}")
+        return tf_label, value
+
+    results = await asyncio.gather(*(one_tf(lbl, iv) for (lbl, iv) in TIMEFRAMES))
+    return {label: value for label, value in results}
+
+
 def format_rsi_line(values: Dict[str, float]) -> str:
     parts = []
     for label, _ in TIMEFRAMES:
@@ -1019,6 +1168,72 @@ def format_stoch_rsi_line(values: Dict[str, float]) -> str:
         else:
             parts.append(f"{label} <code>{value:.2f}</code>")
     return "Stoch RSI: " + " | ".join(parts)
+
+
+def format_macd_lines(values: Dict[str, Tuple[float, float, float]]) -> Tuple[str, str, str]:
+    macd_parts = []
+    dif_parts = []
+    dea_parts = []
+    for label, _ in TIMEFRAMES:
+        triple = values.get(label)
+        if not triple:
+            macd_parts.append(f"{label} <code>n/a</code>")
+            dif_parts.append(f"{label} <code>n/a</code>")
+            dea_parts.append(f"{label} <code>n/a</code>")
+        else:
+            macd, dif, dea = triple
+            macd_parts.append(f"{label} <code>{macd:.4f}</code>")
+            dif_parts.append(f"{label} <code>{dif:.4f}</code>")
+            dea_parts.append(f"{label} <code>{dea:.4f}</code>")
+    return (
+        "MACD: " + " | ".join(macd_parts),
+        "DIF: " + " | ".join(dif_parts),
+        "DEA: " + " | ".join(dea_parts),
+    )
+
+
+def ema_series(values: List[float], period: int) -> List[Optional[float]]:
+    if not values or len(values) < period:
+        return []
+    multiplier = 2 / (period + 1)
+    ema_values: List[Optional[float]] = [None] * (period - 1)
+    sma = sum(values[:period]) / period
+    ema = sma
+    ema_values.append(ema)
+    for value in values[period:]:
+        ema = (value - ema) * multiplier + ema
+        ema_values.append(ema)
+    return ema_values
+
+
+def macd_from_closes(
+    closes: List[float],
+    fast_period: int = 12,
+    slow_period: int = 26,
+    signal_period: int = 9,
+) -> Optional[Tuple[float, float, float]]:
+    if len(closes) < slow_period + signal_period:
+        return None
+    ema_fast = ema_series(closes, fast_period)
+    ema_slow = ema_series(closes, slow_period)
+    if not ema_fast or not ema_slow:
+        return None
+    dif_values: List[float] = []
+    for fast, slow in zip(ema_fast, ema_slow):
+        if fast is None or slow is None:
+            continue
+        dif_values.append(fast - slow)
+    if len(dif_values) < signal_period:
+        return None
+    dea_series = ema_series(dif_values, signal_period)
+    if not dea_series:
+        return None
+    dea = dea_series[-1]
+    dif = dif_values[-1]
+    if dea is None:
+        return None
+    macd = (dif - dea) * 2
+    return macd, dif, dea
 
 
 # =========================
@@ -1727,6 +1942,43 @@ async def delete_alert_state(
 # =========================
 # CACHES
 # =========================
+async def get_innovation_zone_symbols(
+    app: Application,
+    session: aiohttp.ClientSession,
+    rate_limiter: RateLimiter,
+) -> Set[str]:
+    """
+    Fetch Innovation Zone symbols (fee group 6). Fail-open on errors.
+
+    Test hint: mock `/v5/market/fee-group-info` to return result.list[*].symbols
+    including a known symbol (e.g. "FOOUSDTPERP") and verify it is filtered
+    from auto-selected universes but still accepted for manual symbol input.
+    """
+    cache_lock: asyncio.Lock = app.bot_data["innovation_symbols_lock"]
+    async with cache_lock:
+        now = time.time()
+        cached = app.bot_data.get("innovation_symbols_cache")
+        if cached and (now - cached.ts) <= INNOVATION_SYMBOLS_CACHE_TTL:
+            return cached.value  # type: ignore
+
+        url = f"{BYBIT_BASE_URL}/v5/market/fee-group-info"
+        params = {"productType": "contract", "groupId": "6"}
+        symbols: Set[str] = set()
+        try:
+            payload = await api_get_json(session, url, params, rate_limiter)
+            items = (payload.get("result") or {}).get("list") or []
+            for item in items:
+                for symbol in item.get("symbols") or []:
+                    if isinstance(symbol, str):
+                        symbols.add(symbol)
+        except Exception as e:
+            logging.warning("Failed to fetch Innovation Zone symbols: %s", e)
+            symbols = set()
+
+        app.bot_data["innovation_symbols_cache"] = CacheItem(ts=now, value=symbols)
+        return symbols
+
+
 async def get_cached_perp_symbols(app: Application) -> Set[str]:
     cache_lock: asyncio.Lock = app.bot_data["perp_symbols_lock"]
     async with cache_lock:
@@ -1737,7 +1989,14 @@ async def get_cached_perp_symbols(app: Application) -> Set[str]:
 
         session: aiohttp.ClientSession = app.bot_data["http_session"]
         rate_limiter: RateLimiter = app.bot_data["rate_limiter"]
-        symbols = set(await get_all_usdt_linear_perp_symbols(session, rate_limiter))
+        innovation_symbols = await get_innovation_zone_symbols(app, session, rate_limiter)
+        symbols = set(
+            await get_all_usdt_linear_perp_symbols(
+                session,
+                rate_limiter,
+                innovation_symbols=innovation_symbols,
+            )
+        )
         app.bot_data["perp_symbols_cache"] = CacheItem(ts=now, value=symbols)
         save_perp_symbols(symbols)
         return symbols
@@ -1755,7 +2014,14 @@ async def get_cached_top_symbols(app: Application) -> List[str]:
         rate_limiter: RateLimiter = app.bot_data["rate_limiter"]
         try:
             perp_symbols = await get_cached_perp_symbols(app)
-            top = await pick_top_symbols_by_turnover(session, rate_limiter, perp_symbols, MAX_SYMBOLS)
+            innovation_symbols = await get_innovation_zone_symbols(app, session, rate_limiter)
+            top = await pick_top_symbols_by_turnover(
+                session,
+                rate_limiter,
+                perp_symbols,
+                MAX_SYMBOLS,
+                innovation_symbols=innovation_symbols,
+            )
         except Exception as e:
             if cached:
                 logging.warning("Failed to refresh tickers cache, using stale data: %s", e)
@@ -2599,6 +2865,7 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         try:
             rsi_values = await get_rsi_values(session, rate_limiter, sem, symbol)
             stoch_values = await get_stoch_rsi_values(session, rate_limiter, symbol, sem)
+            macd_values = await get_macd_values(session, rate_limiter, sem, symbol)
         except Exception as e:
             logging.exception("PAIR INFO calc failed: %s", e)
             await update.message.reply_text(f"Ошибка расчёта {symbol}: {e}")
@@ -2606,7 +2873,8 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         rsi_line = format_rsi_line(rsi_values)
         stoch_line = format_stoch_rsi_line(stoch_values)
-        msg = f"<b>{symbol}</b>\n{rsi_line}\n{stoch_line}"
+        macd_line, dif_line, dea_line = format_macd_lines(macd_values)
+        msg = f"<b>{symbol}</b>\n{rsi_line}\n{stoch_line}\n{macd_line}\n{dif_line}\n{dea_line}"
         await update.message.reply_text(msg, parse_mode="HTML", reply_markup=pair_info_actions_kb(symbol))
         return
 
@@ -3101,6 +3369,7 @@ async def post_init(app: Application):
     app.bot_data["state_save_task"] = asyncio.create_task(state_save_worker(app))
     app.bot_data["perp_symbols_lock"] = asyncio.Lock()
     app.bot_data["tickers_lock"] = asyncio.Lock()
+    app.bot_data["innovation_symbols_lock"] = asyncio.Lock()
     app.bot_data["http_sem"] = asyncio.Semaphore(MAX_CONCURRENCY)
     app.bot_data["monitor_tasks"] = set()
     app.bot_data["state"] = load_state()
@@ -3111,6 +3380,7 @@ async def post_init(app: Application):
     if cached_symbols:
         app.bot_data["perp_symbols_cache"] = CacheItem(ts=0.0, value=cached_symbols)
     app.bot_data["tickers_cache"] = None
+    app.bot_data["innovation_symbols_cache"] = None
     app.bot_data["alert_cooldowns"] = {}
     app.bot_data["alert_error_notify"] = {}
     app.job_queue.run_repeating(cleanup_job, interval=CLEANUP_INTERVAL_SEC, first=CLEANUP_INTERVAL_SEC)
