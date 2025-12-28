@@ -7,6 +7,8 @@ import logging
 import os
 import random
 import sys
+import shutil
+import weakref
 from math import ceil
 import time
 import math
@@ -14,7 +16,7 @@ from decimal import Decimal, InvalidOperation
 from dataclasses import dataclass
 from datetime import datetime
 from io import BytesIO
-from typing import Callable, Dict, List, Optional, Tuple, Set
+from typing import Awaitable, Callable, Dict, FrozenSet, List, Optional, Tuple, Set, cast
 from zoneinfo import ZoneInfo
 
 import aiohttp
@@ -22,7 +24,7 @@ from dotenv import load_dotenv
 from PIL import Image, ImageDraw, ImageFont
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
-from telegram.error import BadRequest, Forbidden, NetworkError, TimedOut
+from telegram.error import BadRequest, Forbidden, NetworkError, TimedOut, RetryAfter
 from telegram.request import HTTPXRequest
 from telegram.ext import (
     Application,
@@ -106,6 +108,7 @@ MAX_ALERTS_GLOBAL = int(os.getenv("MAX_ALERTS_GLOBAL", "1000"))
 ALERT_TTL_HOURS = float(os.getenv("ALERT_TTL_HOURS", "24"))
 ALERT_COOLDOWN_SEC = int(os.getenv("ALERT_COOLDOWN_SEC", "0"))
 ALERT_MAX_BACKOFF_SEC = int(os.getenv("ALERT_MAX_BACKOFF_SEC", "3600"))
+HEAVY_ACTION_COOLDOWN_SEC = int(os.getenv("HEAVY_ACTION_COOLDOWN_SEC", "5"))
 SHUTDOWN_TASK_TIMEOUT = int(os.getenv("SHUTDOWN_TASK_TIMEOUT", "10"))
 CLEANUP_INTERVAL_SEC = int(os.getenv("CLEANUP_INTERVAL_SEC", "600"))
 ALERT_MAX_CONCURRENCY = int(os.getenv("ALERT_MAX_CONCURRENCY", "10"))
@@ -160,6 +163,7 @@ DEFAULT_MONITOR_TIMEOUT = max(
     ),
 )
 MONITOR_TIMEOUT = int(os.getenv("MONITOR_TIMEOUT", str(DEFAULT_MONITOR_TIMEOUT)))
+MAX_MONITOR_TIMEOUT = int(os.getenv("MAX_MONITOR_TIMEOUT", str(60 * 60)))
 
 # =========================
 # CONFIG VALIDATION
@@ -197,6 +201,8 @@ def validate_config() -> None:
         errors.append("ALERT_MAX_BACKOFF_SEC must be > 0")
     if ALERT_MAX_CONCURRENCY <= 0:
         errors.append("ALERT_MAX_CONCURRENCY must be > 0")
+    if HEAVY_ACTION_COOLDOWN_SEC < 0:
+        errors.append("HEAVY_ACTION_COOLDOWN_SEC must be >= 0")
     if BINANCE_SYMBOLS_CACHE_TTL <= 0:
         errors.append("BINANCE_SYMBOLS_CACHE_TTL must be > 0")
     if MAX_SYMBOLS <= 0:
@@ -205,6 +211,8 @@ def validate_config() -> None:
         errors.append("MAX_CONCURRENCY must be > 0")
     if KLINE_LIMIT <= 0:
         errors.append("KLINE_LIMIT must be > 0")
+    if MAX_MONITOR_TIMEOUT <= 0:
+        errors.append("MAX_MONITOR_TIMEOUT must be > 0")
     if RSI_PERIOD <= 0:
         errors.append("RSI_PERIOD must be > 0")
     if STOCH_RSI_RSI_LEN <= 0:
@@ -249,10 +257,51 @@ def validate_config() -> None:
 # =========================
 # LOGGING
 # =========================
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-)
+_LOG_RECORD_ATTRS = {
+    "args",
+    "asctime",
+    "created",
+    "exc_info",
+    "exc_text",
+    "filename",
+    "funcName",
+    "levelname",
+    "levelno",
+    "lineno",
+    "module",
+    "msecs",
+    "message",
+    "msg",
+    "name",
+    "pathname",
+    "process",
+    "processName",
+    "relativeCreated",
+    "stack_info",
+    "thread",
+    "threadName",
+}
+
+
+class JSONFormatter(logging.Formatter):
+    def format(self, record: logging.LogRecord) -> str:
+        payload = {
+            "time": self.formatTime(record, self.datefmt),
+            "level": record.levelname,
+            "logger": record.name,
+            "message": record.getMessage(),
+        }
+        extra = {k: v for k, v in record.__dict__.items() if k not in _LOG_RECORD_ATTRS}
+        if extra:
+            payload["extra"] = extra
+        if record.exc_info:
+            payload["exc_info"] = self.formatException(record.exc_info)
+        return json.dumps(payload, ensure_ascii=False)
+
+
+_handler = logging.StreamHandler()
+_handler.setFormatter(JSONFormatter())
+logging.basicConfig(level=logging.INFO, handlers=[_handler])
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("telegram.request").setLevel(logging.WARNING)
 
@@ -292,11 +341,22 @@ def load_state() -> dict:
 def save_state_json(state_json: str) -> bool:
     tmp = None
     try:
+        encoded = state_json.encode("utf-8")
+        base_dir = os.path.dirname(STATE_FILE) or "."
+        try:
+            free_bytes = shutil.disk_usage(base_dir).free
+            if free_bytes < len(encoded) + 1024:
+                logging.error("Failed to save state: insufficient disk space")
+                return False
+        except Exception as e:
+            logging.warning("Failed to check free disk space: %s", e)
         tmp = STATE_FILE + ".tmp"
         with open(tmp, "w", encoding="utf-8") as f:
             f.write(state_json)
+            f.flush()
+            os.fsync(f.fileno())
         os.replace(tmp, STATE_FILE)
-        logging.debug("State saved to %s (%d bytes)", STATE_FILE, len(state_json))
+        logging.debug("State saved to %s (%d bytes)", STATE_FILE, len(encoded))
         return True
     except OSError as e:
         if e.errno == 28:
@@ -624,6 +684,68 @@ def normalize_price_text(value: Decimal) -> str:
     if "." in text:
         text = text.rstrip("0").rstrip(".")
     return text or "0"
+
+
+def get_required_bot_data(
+    app: Application,
+    key: str,
+    default_factory: Optional[Callable[[], object]] = None,
+) -> object:
+    value = app.bot_data.get(key)
+    if value is not None:
+        return value
+    if default_factory is not None:
+        value = default_factory()
+        app.bot_data[key] = value
+        return value
+    raise RuntimeError(f"Missing required bot_data key: {key}")
+
+
+def log_event(level: int, message: str, **fields: object) -> None:
+    logging.log(level, message, extra=fields)
+
+
+async def tg_call_with_retry(
+    call: Callable[..., Awaitable[object]],
+    *args: object,
+    **kwargs: object,
+) -> object:
+    attempts = 4
+    backoff = 0.8
+    for attempt in range(1, attempts + 1):
+        try:
+            return await call(*args, **kwargs)
+        except RetryAfter as e:
+            jitter = random.uniform(0.2, 0.6)
+            await asyncio.sleep(e.retry_after + jitter)
+        except (TimedOut, NetworkError):
+            if attempt >= attempts:
+                raise
+            jitter = random.uniform(0.2, 0.6)
+            await asyncio.sleep(backoff + jitter)
+            backoff = min(backoff * 2, 10.0)
+    return None
+
+
+async def check_action_cooldown(
+    app: Application,
+    chat_id: int,
+    action_key: str,
+    cooldown_sec: int,
+) -> float:
+    if cooldown_sec <= 0:
+        return 0.0
+    cooldowns = app.bot_data.setdefault("heavy_action_cooldowns", {})
+    lock: asyncio.Lock = app.bot_data.setdefault("heavy_action_cooldowns_lock", asyncio.Lock())
+    now = time.time()
+    remaining = 0.0
+    async with lock:
+        last_ts = cooldowns.get((chat_id, action_key), 0.0)
+        remaining = cooldown_sec - (now - last_ts)
+        if remaining <= 0:
+            cooldowns[(chat_id, action_key)] = now
+            return 0.0
+    return remaining
 
 
 def needs_price_confirmation(current_price: float, target_price: Decimal) -> bool:
@@ -975,7 +1097,7 @@ async def binance_get_closes(
     return closes
 
 
-async def get_binance_futures_symbols(session: aiohttp.ClientSession) -> Set[str]:
+async def get_binance_futures_symbols(session: aiohttp.ClientSession) -> FrozenSet[str]:
     global BINANCE_SYMBOLS_CACHE
     global BINANCE_SYMBOLS_CACHE_LOCK
 
@@ -1033,8 +1155,9 @@ async def get_binance_futures_symbols(session: aiohttp.ClientSession) -> Set[str
                 return BINANCE_SYMBOLS_CACHE.value  # type: ignore[return-value]
             raise
 
-        BINANCE_SYMBOLS_CACHE = CacheItem(ts=now, value=symbols)
-        return symbols
+        frozen_symbols = frozenset(symbols)
+        BINANCE_SYMBOLS_CACHE = CacheItem(ts=now, value=frozen_symbols)
+        return frozen_symbols
 
 
 async def get_kline_rows(
@@ -1069,15 +1192,12 @@ async def get_kline_closes(
     symbol: str,
     interval: str,
     limit: int,
-    fallback_used: bool = False,
 ) -> List[float]:
     try:
         rows = await get_kline_rows(session, rate_limiter, symbol, interval, limit)
         if not rows:
             raise BybitAPIError(f"No kline rows for {symbol} interval={interval} limit={limit}")
     except RateLimitError as e:
-        if fallback_used:
-            raise e
         tf_label = TIMEFRAME_BY_INTERVAL.get(interval, interval)
         logging.warning(
             "Bybit rate limit for RSI klines (%s, %s). Falling back to Binance.",
@@ -2565,7 +2685,7 @@ async def get_cached_top_symbols(app: Application) -> List[str]:
         rate_limiter: RateLimiter = app.bot_data["rate_limiter"]
         try:
             perp_symbols = await get_cached_perp_symbols(app)
-            innovation_symbols = await get_innovation_zone_symbols(app, session, rate_limiter)
+            innovation_symbols = await _refresh_innovation_zone_symbols(app, session, rate_limiter)
             top = await pick_top_symbols_by_turnover(
                 session,
                 rate_limiter,
@@ -2868,20 +2988,26 @@ async def send_scan_result(
     short_syms = [r.symbol for r in short_rows]
 
     png = render_png(long_rows, short_rows, symbols_scanned=symbols_scanned)
-    await app.bot.send_photo(chat_id=chat_id, photo=png)
+    await tg_call_with_retry(app.bot.send_photo, chat_id=chat_id, photo=png)
 
     text = build_pairs_text(long_syms, short_syms)
     kb = pairs_keyboard(long_syms, short_syms)
-    await app.bot.send_message(chat_id=chat_id, text=text, reply_markup=kb)
+    await tg_call_with_retry(app.bot.send_message, chat_id=chat_id, text=text, reply_markup=kb)
 
 
 async def run_monitor_once_internal(app: Application, chat_id: int, timeout_sec: Optional[int] = None):
     """Internal monitor function without timeout wrapper."""
     start_ts = time.monotonic()
-    session: aiohttp.ClientSession = app.bot_data["http_session"]
-    rate_limiter: RateLimiter = app.bot_data["rate_limiter"]
+    session = cast(
+        aiohttp.ClientSession,
+        get_required_bot_data(app, "http_session", aiohttp.ClientSession),
+    )
+    rate_limiter = cast(RateLimiter, get_required_bot_data(app, "rate_limiter", RateLimiter))
     symbols = await get_cached_top_symbols(app)
-    sem: asyncio.Semaphore = app.bot_data["http_sem"]
+    sem = cast(
+        asyncio.Semaphore,
+        get_required_bot_data(app, "http_sem", lambda: asyncio.Semaphore(MAX_CONCURRENCY)),
+    )
     logging.debug("monitor_start chat_id=%s symbols=%d", chat_id, len(symbols))
 
     results: List[MonitorRow] = []
@@ -3006,24 +3132,40 @@ async def run_monitor_once(app: Application, chat_id: int):
     lock = locks.setdefault(chat_id, asyncio.Lock())
 
     if lock.locked():
-        await app.bot.send_message(chat_id=chat_id, text="⏳ Мониторинг уже выполняется, подождите…")
+        await tg_call_with_retry(
+            app.bot.send_message,
+            chat_id=chat_id,
+            text="⏳ Мониторинг уже выполняется, подождите…",
+        )
         return
 
-    monitor_tasks: Set[asyncio.Task] = app.bot_data.setdefault("monitor_tasks", set())
+    monitor_tasks = cast(weakref.WeakSet, app.bot_data.setdefault("monitor_tasks", weakref.WeakSet()))
     current_task = asyncio.current_task()
+    acquired = False
     try:
         if current_task:
             monitor_tasks.add(current_task)
-        await lock.acquire()
-        rate_limiter: RateLimiter = app.bot_data["rate_limiter"]
+        try:
+            await asyncio.wait_for(lock.acquire(), timeout=0.05)
+            acquired = True
+        except asyncio.TimeoutError:
+            await tg_call_with_retry(
+                app.bot.send_message,
+                chat_id=chat_id,
+                text="⏳ Мониторинг уже выполняется, подождите…",
+            )
+            return
+        rate_limiter = cast(RateLimiter, get_required_bot_data(app, "rate_limiter", RateLimiter))
         current_delay = await rate_limiter.get_current_delay()
         delay_factor = max(1.0, current_delay / RATE_LIMIT_DELAY)
-        adaptive_timeout = int(MONITOR_TIMEOUT * delay_factor)
-        logging.info("monitor_start chat_id=%s timeout=%ss", chat_id, adaptive_timeout)
+        adaptive_timeout = int(MONITOR_TIMEOUT * delay_factor * 1.15)
+        adaptive_timeout = min(adaptive_timeout, MAX_MONITOR_TIMEOUT)
+        log_event(logging.INFO, "monitor_start", chat_id=chat_id, timeout_sec=adaptive_timeout)
         await run_monitor_once_internal(app, chat_id, timeout_sec=adaptive_timeout)
-        logging.info("monitor_done chat_id=%s", chat_id)
+        log_event(logging.INFO, "monitor_done", chat_id=chat_id)
     finally:
-        lock.release()
+        if acquired:
+            lock.release()
         if current_task:
             monitor_tasks.discard(current_task)
 
@@ -3153,7 +3295,8 @@ async def alert_job_callback(context: ContextTypes.DEFAULT_TYPE):
             triggered = (not prev) and condition_met
             if triggered or near:
                 extra = f"hit {trigger_label}" if triggered else f"hit ≈ {threshold:.0f}"
-                await app.bot.send_message(
+                await tg_call_with_retry(
+                    app.bot.send_message,
                     chat_id=chat_id,
                     text=(
                         f"🔔 ALERT {symbol} {direction_label} RSI{RSI_PERIOD}({tf_label}) {extra}\n"
@@ -3183,7 +3326,8 @@ async def alert_job_callback(context: ContextTypes.DEFAULT_TYPE):
             throttle_sec = ALERT_ERROR_THROTTLE_MIN * 60
             if now - last_sent >= throttle_sec:
                 try:
-                    await app.bot.send_message(
+                    await tg_call_with_retry(
+                        app.bot.send_message,
                         chat_id=chat_id,
                         text=f"Alert {symbol}({tf_label}) временно не проверяется из-за ошибки API.",
                     )
@@ -3197,7 +3341,8 @@ async def alert_job_callback(context: ContextTypes.DEFAULT_TYPE):
                 data["backoff_sec"] = next_backoff
                 data["next_retry_ts"] = now + next_backoff
                 try:
-                    await app.bot.send_message(
+                    await tg_call_with_retry(
+                        app.bot.send_message,
                         chat_id=chat_id,
                         text=(
                             f"⚠️ Ошибка при проверке алерта {symbol}({tf_label}). "
@@ -3217,6 +3362,9 @@ async def cleanup_job(context: ContextTypes.DEFAULT_TYPE) -> None:
 
     cooldowns = app.bot_data.setdefault("alert_cooldowns", {})
     prune_ttl_dict(cooldowns, ALERT_COOLDOWN_CACHE_TTL_SEC, now)
+
+    heavy_cooldowns = app.bot_data.setdefault("heavy_action_cooldowns", {})
+    prune_ttl_dict(heavy_cooldowns, ALERT_COOLDOWN_CACHE_TTL_SEC, now)
 
     monitor_tasks: Set[asyncio.Task] = app.bot_data.get("monitor_tasks", set())
     if monitor_tasks:
@@ -3642,12 +3790,20 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data["await_price_alert"] = False
         context.user_data.pop("price_alert_symbol", None)
         context.user_data.pop("price_alert_confirm", None)
-        await app.bot.send_message(chat_id=chat_id, text="Собираю данные…")
+        remaining = await check_action_cooldown(app, chat_id, "RUN_NOW", HEAVY_ACTION_COOLDOWN_SEC)
+        if remaining > 0:
+            await tg_call_with_retry(
+                app.bot.send_message,
+                chat_id=chat_id,
+                text=f"Подожди {int(math.ceil(remaining))} сек перед следующим запросом.",
+            )
+            return
+        await tg_call_with_retry(app.bot.send_message, chat_id=chat_id, text="Собираю данные…")
         try:
             await run_monitor_once(app, chat_id)
         except Exception as e:
             logging.exception("RUN_NOW failed: %s", e)
-            await app.bot.send_message(chat_id=chat_id, text=f"Ошибка: {e}")
+            await tg_call_with_retry(app.bot.send_message, chat_id=chat_id, text=f"Ошибка: {e}")
         return
 
     if data == "PAIR_INFO":
@@ -3839,21 +3995,30 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         try:
             _, side, symbol = data.split("|", 2)
             if side not in {"L", "S"}:
-                await app.bot.send_message(chat_id=chat_id, text="Некорректное направление.")
+                await tg_call_with_retry(app.bot.send_message, chat_id=chat_id, text="Некорректное направление.")
                 return
 
             valid_symbols = await get_valid_symbols_with_fallback(app)
             if not valid_symbols:
-                await app.bot.send_message(chat_id=chat_id, text="Whitelist временно недоступен.")
+                await tg_call_with_retry(app.bot.send_message, chat_id=chat_id, text="Whitelist временно недоступен.")
                 return
 
             if not validate_symbol(symbol, valid_symbols):
-                await app.bot.send_message(chat_id=chat_id, text="Некорректный символ.")
+                await tg_call_with_retry(app.bot.send_message, chat_id=chat_id, text="Некорректный символ.")
                 return
         except Exception:
             return
 
-        await app.bot.send_message(chat_id=chat_id, text=f"Считаю {symbol}…")
+        remaining = await check_action_cooldown(app, chat_id, "PAIR", HEAVY_ACTION_COOLDOWN_SEC)
+        if remaining > 0:
+            await tg_call_with_retry(
+                app.bot.send_message,
+                chat_id=chat_id,
+                text=f"Подожди {int(math.ceil(remaining))} сек перед следующим расчётом.",
+            )
+            return
+
+        await tg_call_with_retry(app.bot.send_message, chat_id=chat_id, text=f"Считаю {symbol}…")
 
         try:
             price = await get_last_price(session, rate_limiter, symbol)
@@ -3882,7 +4047,8 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"{dea_line}\n"
             )
 
-            await app.bot.send_message(
+            await tg_call_with_retry(
+                app.bot.send_message,
                 chat_id=chat_id,
                 text=msg,
                 parse_mode="HTML",
@@ -3891,7 +4057,11 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         except Exception as e:
             logging.exception("PAIR calc failed: %s", e)
-            await app.bot.send_message(chat_id=chat_id, text=f"Ошибка расчёта {symbol}: {e}")
+            await tg_call_with_retry(
+                app.bot.send_message,
+                chat_id=chat_id,
+                text=f"Ошибка расчёта {symbol}: {e}",
+            )
 
         return
 
@@ -3929,11 +4099,19 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         if ALERT_COOLDOWN_SEC > 0:
             cooldowns = app.bot_data.setdefault("alert_cooldowns", {})
+            cd_lock: asyncio.Lock = app.bot_data.setdefault("alert_cooldowns_lock", asyncio.Lock())
             now = time.time()
-            last_ts = cooldowns.get(chat_id, 0.0)
-            remaining = ALERT_COOLDOWN_SEC - (now - last_ts)
-            if remaining > 0:
-                await app.bot.send_message(
+            allowed = False
+            remaining = 0.0
+            async with cd_lock:
+                last_ts = cooldowns.get(chat_id, 0.0)
+                remaining = ALERT_COOLDOWN_SEC - (now - last_ts)
+                if remaining <= 0:
+                    cooldowns[chat_id] = now
+                    allowed = True
+            if not allowed:
+                await tg_call_with_retry(
+                    app.bot.send_message,
                     chat_id=chat_id,
                     text=f"Подожди {int(math.ceil(remaining))} сек перед созданием нового алерта.",
                 )
@@ -3951,15 +4129,17 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             valid_symbols=valid_symbols,
         )
         if not ok:
-            await app.bot.send_message(chat_id=chat_id, text=err or "Не удалось создать алерт.")
+            await tg_call_with_retry(
+                app.bot.send_message,
+                chat_id=chat_id,
+                text=err or "Не удалось создать алерт.",
+            )
             return
-        if ALERT_COOLDOWN_SEC > 0:
-            cooldowns = app.bot_data.setdefault("alert_cooldowns", {})
-            cooldowns[chat_id] = time.time()
         await schedule_alert(app, chat_id, symbol, tf, tf_label, side, valid_symbols)
 
         check_interval_sec = alert_check_interval_sec(tf)
-        await app.bot.send_message(
+        await tg_call_with_retry(
+            app.bot.send_message,
             chat_id=chat_id,
             text=(
                 f"✅ Alert включён: {symbol} {direction_label} RSI{RSI_PERIOD}({tf_label}) {trigger_label} "
@@ -3993,7 +4173,7 @@ async def post_init(app: Application):
         app.bot_data["innovation_symbols_lock"] = asyncio.Lock()
         app.bot_data["http_sem"] = asyncio.Semaphore(MAX_CONCURRENCY)
         app.bot_data["alert_sem"] = asyncio.Semaphore(ALERT_MAX_CONCURRENCY)
-        app.bot_data["monitor_tasks"] = set()
+        app.bot_data["monitor_tasks"] = weakref.WeakSet()
         app.bot_data["monitor_locks"] = {}
         app.bot_data["state"] = load_state()
         app.bot_data["state"].setdefault("pair_rsi_alerts", {})
@@ -4006,6 +4186,9 @@ async def post_init(app: Application):
         app.bot_data["innovation_symbols_cache"] = None
         app.bot_data["innovation_symbols_refresh_task"] = None
         app.bot_data["alert_cooldowns"] = {}
+        app.bot_data.setdefault("alert_cooldowns_lock", asyncio.Lock())
+        app.bot_data.setdefault("heavy_action_cooldowns", {})
+        app.bot_data.setdefault("heavy_action_cooldowns_lock", asyncio.Lock())
         app.bot_data["alert_error_notify"] = {}
         app.job_queue.run_repeating(cleanup_job, interval=CLEANUP_INTERVAL_SEC, first=CLEANUP_INTERVAL_SEC)
 
@@ -4059,7 +4242,7 @@ async def post_init(app: Application):
         app.bot_data["innovation_symbols_lock"] = asyncio.Lock()
         app.bot_data["http_sem"] = asyncio.Semaphore(MAX_CONCURRENCY)
         app.bot_data["alert_sem"] = asyncio.Semaphore(ALERT_MAX_CONCURRENCY)
-        app.bot_data["monitor_tasks"] = set()
+        app.bot_data["monitor_tasks"] = weakref.WeakSet()
         app.bot_data["monitor_locks"] = {}
         app.bot_data["state"] = load_state()
         app.bot_data["state"].setdefault("pair_rsi_alerts", {})
@@ -4069,13 +4252,16 @@ async def post_init(app: Application):
         app.bot_data["innovation_symbols_cache"] = None
         app.bot_data["innovation_symbols_refresh_task"] = None
         app.bot_data["alert_cooldowns"] = {}
+        app.bot_data.setdefault("alert_cooldowns_lock", asyncio.Lock())
+        app.bot_data.setdefault("heavy_action_cooldowns", {})
+        app.bot_data.setdefault("heavy_action_cooldowns_lock", asyncio.Lock())
         app.bot_data["alert_error_notify"] = {}
 
 
 async def post_shutdown(app: Application):
     global BINANCE_SYMBOLS_CACHE
     global BINANCE_SYMBOLS_CACHE_LOCK
-    monitor_tasks: Set[asyncio.Task] = app.bot_data.get("monitor_tasks", set())
+    monitor_tasks = cast(weakref.WeakSet, app.bot_data.get("monitor_tasks", weakref.WeakSet()))
     for task in list(monitor_tasks):
         if not task.done():
             task.cancel()
@@ -4092,6 +4278,7 @@ async def post_shutdown(app: Application):
     if sess:
         await sess.close()
     BINANCE_SYMBOLS_CACHE = None
+    BINANCE_SYMBOLS_CACHE_LOCK = None
     await flush_state(app)
 
 
